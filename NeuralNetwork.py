@@ -64,26 +64,6 @@ class NeuralNetwork(nn.Module):
             else:
                 print(f"Epoch {epoch+1}/{epochs}, Train Loss: {epoch_loss:.4f}")
 
-            # --Validation--
-            if val_loader:
-                self.eval()
-                correct = 0
-                total = 0
-                val_loss = 0.0
-                with torch.no_grad():
-                    for X_val, y_val in val_loader:
-                        logits = self(X_val)
-                        loss = criterion(logits, y_val)
-                        val_loss += loss.item() * X_val.size(0)
-                        preds = logits.argmax(dim=1)
-                        correct += (preds == y_val).sum().item()
-                        total += y_val.size(0)
-                val_loss /= len(val_loader.dataset)
-                val_acc = correct / total
-                print(f"Epoch {epoch+1}/{epochs}, Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-            else:
-                print(f"Epoch {epoch+1}/{epochs}, Train Loss: {epoch_loss:.4f}")
-
     def predict(self, test_loader):
         self.eval()
         all_preds = []

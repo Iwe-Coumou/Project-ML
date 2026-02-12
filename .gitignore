@@ -1,0 +1,4 @@
+# Ignore EMNIST raw files
+data/EMNIST/raw/*idx3-ubyte
+data/EMNIST/raw/*idx1-ubyte
+data/EMNIST/raw/gzip.zip
