@@ -3,6 +3,7 @@ import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+from tqdm import tqdm
 
 class NeuralNetwork(nn.Module):
     def __init__(self, input_size=28*28, hidden_sizes=[512, 256], output_size=10):
@@ -32,7 +33,7 @@ class NeuralNetwork(nn.Module):
             # --Training--
             self.train()
             running_loss = 0.0
-            for X_batch, y_batch in train_loader:
+            for X_batch, y_batch in tqdm(train_loader):
                 logits = self(X_batch)
                 loss = criterion(logits, y_batch)
 
