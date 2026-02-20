@@ -4,6 +4,7 @@ from torch import nn, optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from tqdm import tqdm
+import pandas as pd
 
 class NeuralNetwork(nn.Module):
     def __init__(self, input_size=28*28, hidden_sizes=[512, 256], output_size=10):
@@ -29,41 +30,61 @@ class NeuralNetwork(nn.Module):
         criterion = nn.CrossEntropyLoss() if loss_function is None else loss_function
         optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=1e-4) if optimizer is None else optimizer
 
-        for epoch in tqdm(range(epochs)):
+        n_train_batches = len(train_loader)
+        n_val_batches = len(val_loader) if val_loader else 0
+        total_steps = n_train_batches + n_val_batches
+
+        metrics = []
+        for epoch in range(epochs):
             # --Training--
             self.train()
             running_loss = 0.0
-            for X_batch, y_batch in train_loader:
-                logits = self(X_batch)
-                loss = criterion(logits, y_batch)
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+            with tqdm(total=total_steps, desc=f"Epoch {epoch+1}/{epochs}") as epoch_bar:
 
-                running_loss += loss.item() * X_batch.size(0)
+                for X_batch, y_batch in train_loader:
+                    logits = self(X_batch)
+                    loss = criterion(logits, y_batch)
 
-            epoch_loss = running_loss / len(train_loader.dataset)
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
 
-            # --Validation--
-            if val_loader:
-                self.eval()
-                correct = 0
-                total = 0
-                val_loss = 0.0
-                with torch.no_grad():
-                    for X_val, y_val in val_loader:
-                        logits = self(X_val)
-                        loss = criterion(logits, y_val)
-                        val_loss += loss.item() * X_val.size(0)
-                        preds = logits.argmax(dim=1)
-                        correct += (preds == y_val).sum().item()
-                        total += y_val.size(0)
-                val_loss /= len(val_loader.dataset)
-                val_acc = correct / total
-                print(f"Epoch {epoch+1}/{epochs}, Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-            else:
-                print(f"Epoch {epoch+1}/{epochs}, Train Loss: {epoch_loss:.4f}")
+                    running_loss += loss.item() * X_batch.size(0)
+                    epoch_bar.update(1)
+
+                epoch_train_loss = running_loss / len(train_loader.dataset)
+
+                # --Validation--
+                if val_loader:
+                    self.eval()
+                    correct = 0
+                    total = 0
+                    epoch_val_loss = 0.0
+
+                    with torch.no_grad():
+                        for X_val, y_val in val_loader:
+                            logits = self(X_val)
+                            loss = criterion(logits, y_val)
+                            epoch_val_loss += loss.item() * X_val.size(0)
+                            preds = logits.argmax(dim=1)
+                            correct += (preds == y_val).sum().item()
+                            total += y_val.size(0)
+                            epoch_bar.update(1)
+
+                    epoch_val_loss /= len(val_loader.dataset)
+                    val_acc = correct / total
+
+            metrics.append({
+                'epoch': epoch+1,
+                'train_loss': epoch_train_loss,
+                'val_loss': epoch_val_loss if val_loader else None,
+                'val_acc': val_acc if val_loader else None
+            })
+
+        metrics = pd.DataFrame(metrics)
+        metrics.set_index('epoch', inplace=True)
+        return metrics
 
     def predict(self, test_loader):
         self.eval()
@@ -90,16 +111,4 @@ class NeuralNetwork(nn.Module):
 
         return correct/total
 
-    def get_activations(self, X):
-        self.eval()
-        with torch.no_grad():
-            activations = {}
-
-            X = self.flatten(X)
-            activations['flatten'] = X
-
-            for name, layer in self.linear_relu_stack.named_children():
-                X = layer(X)
-                activations[name] = X
-
-        return activations
+    
