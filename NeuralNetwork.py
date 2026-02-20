@@ -7,8 +7,10 @@ from tqdm import tqdm
 import pandas as pd
 
 class NeuralNetwork(nn.Module):
-    def __init__(self, input_size=28*28, hidden_sizes=[512, 256], output_size=10):
+    def __init__(self, input_size=28*28, hidden_sizes=[512, 256], output_size=10, device=None):
         super().__init__()
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self.flatten = nn.Flatten()
         
         layers = []
@@ -19,11 +21,13 @@ class NeuralNetwork(nn.Module):
             in_size = h
         layers.append(nn.Linear(in_size, output_size))
         
-        self.linear_relu_stack = nn.Sequential(*layers)
+        self.layer_stack = nn.Sequential(*layers)
+
+        self.to(self.device)
 
     def forward(self, X):
         X = self.flatten(X)
-        logits = self.linear_relu_stack(X)
+        logits = self.layer_stack(X)
         return logits
 
     def train_model(self, train_loader, val_loader=None, epochs=10, lr=0.01, loss_function=None, optimizer=None):
@@ -43,6 +47,9 @@ class NeuralNetwork(nn.Module):
             with tqdm(total=total_steps, desc=f"Epoch {epoch+1}/{epochs}") as epoch_bar:
 
                 for X_batch, y_batch in train_loader:
+                    X_batch = X_batch.to(self.device)
+                    y_batch = y_batch.to(self.device)
+
                     logits = self(X_batch)
                     loss = criterion(logits, y_batch)
 
@@ -64,6 +71,9 @@ class NeuralNetwork(nn.Module):
 
                     with torch.no_grad():
                         for X_val, y_val in val_loader:
+                            X_val = X_val.to(self.device)
+                            y_val = y_val.to(self.device)
+
                             logits = self(X_val)
                             loss = criterion(logits, y_val)
                             epoch_val_loss += loss.item() * X_val.size(0)
@@ -92,6 +102,9 @@ class NeuralNetwork(nn.Module):
 
         with torch.no_grad():
             for X_batch, y_batch in tqdm(test_loader):
+                X_batch = X_batch.to(self.device)
+                y_batch = y_batch.to(self.device)
+
                 logits = self(X_batch)
                 preds = logits.argmax(dim=1)
                 all_preds.append(preds)
@@ -104,52 +117,110 @@ class NeuralNetwork(nn.Module):
 
         with torch.no_grad():
             for X_batch, y_batch in tqdm(data_loader):
+                X_batch = X_batch.to(self.device)
+                y_batch = y_batch.to(self.device)
+
                 logits = self(X_batch)
                 preds = logits.argmax(dim=1)
                 correct += (preds == y_batch).sum().item()
                 total += y_batch.size(0)
 
         return correct/total
-
-    def get_activations(self, X):
+    
+    def get_layer_data(self, X):
         """
-        Returns activations for each layer.
-        X: either a single input tensor (1 batch/sample) or a DataLoader
-        Returns: dict of layer_name -> tensor (single input) or concatenated tensor (DataLoader)
+        Returns:
+            {
+                layer_0: {
+                    'weights': tensor,
+                    'bias': tensor,
+                    'pre_activation': tensor,
+                    'post_activation': tensor
+                },
+                ...
+            }
+
+        X can be a single tensor or a DataLoader.
         """
         self.eval()
-        activations = {}
+        layer_data = {}
 
-        # Prepare layer names
-        layer_names = ['flatten'] + [f'layer_{i}_{layer.__class__.__name__}' 
-                                    for i, layer in enumerate(self.linear_relu_stack)]
+        is_dataloader = isinstance(X, torch.utils.data.DataLoader)
 
-        # Case 1: DataLoader
-        if isinstance(X, torch.utils.data.DataLoader):
-            # Initialize lists for each layer
-            for name in layer_names:
-                activations[name] = []
+        # Identify logical layers (Linear followed by optional ReLU)
+        linear_indices = []
+        for idx, layer in enumerate(self.layer_stack):
+            if isinstance(layer, torch.nn.Linear):
+                linear_indices.append(idx)
 
-            with torch.no_grad():
-                for batch, _ in tqdm(X, desc="Collecting activations", leave=True):
-                    out = self.flatten(batch)
-                    activations['flatten'].append(out)
+        # Initialize dictionary
+        for layer_num, idx in enumerate(linear_indices):
+            linear_layer = self.layer_stack[idx]
+            layer_data[f"layer_{layer_num}"] = {
+                "weights": linear_layer.weight.detach().cpu().clone(),
+                "bias": linear_layer.bias.detach().cpu().clone(),
+                "pre_activation": [],
+                "post_activation": []
+            }
 
-                    for idx, layer in enumerate(self.linear_relu_stack):
+        with torch.no_grad():
+
+            if is_dataloader:
+                iterator = X
+            else:
+                iterator = [(X, None)]
+
+            for batch, _ in iterator:
+                batch = batch.to(self.device)
+
+                out = self.flatten(batch)
+                logical_layer = 0
+
+                i = 0
+                while i < len(self.layer_stack):
+
+                    layer = self.layer_stack[i]
+
+                    if isinstance(layer, torch.nn.Linear):
+
+                        # Linear forward
                         out = layer(out)
-                        activations[f'layer_{idx}_{layer.__class__.__name__}'].append(out)
+                        pre_act = out.detach().cpu().clone()
 
-            # Concatenate all batches
-            for name in activations:
-                activations[name] = torch.cat(activations[name], dim=0)
+                        # Check if next layer is ReLU
+                        if i + 1 < len(self.layer_stack) and \
+                        isinstance(self.layer_stack[i + 1], torch.nn.ReLU):
 
-        # Case 2: Single tensor
-        else:
-            with torch.no_grad():
-                out = self.flatten(X)
-                activations['flatten'] = out
-                for idx, layer in enumerate(self.linear_relu_stack):
-                    out = layer(out)
-                    activations[f'layer_{idx}_{layer.__class__.__name__}'] = out
+                            out = self.layer_stack[i + 1](out)
+                            post_act = out.detach().cpu().clone()
+                            i += 1  # skip ReLU
+                        else:
+                            post_act = out.detach().cpu().clone()
 
-        return activations
+                        layer_name = f"layer_{logical_layer}"
+                        layer_data[layer_name]["pre_activation"].append(pre_act)
+                        layer_data[layer_name]["post_activation"].append(post_act)
+
+                        logical_layer += 1
+
+                    else:
+                        out = layer(out)
+
+                    i += 1
+
+        # Concatenate if DataLoader
+        for layer_name in layer_data:
+            if is_dataloader:
+                layer_data[layer_name]["pre_activation"] = torch.cat(
+                    layer_data[layer_name]["pre_activation"], dim=0
+                )
+                layer_data[layer_name]["post_activation"] = torch.cat(
+                    layer_data[layer_name]["post_activation"], dim=0
+                )
+            else:
+                layer_data[layer_name]["pre_activation"] = \
+                    layer_data[layer_name]["pre_activation"][0]
+                layer_data[layer_name]["post_activation"] = \
+                    layer_data[layer_name]["post_activation"][0]
+
+        return layer_data
