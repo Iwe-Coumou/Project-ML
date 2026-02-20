@@ -2,5 +2,7 @@
 data/EMNIST/raw/*idx3-ubyte
 data/EMNIST/raw/*idx1-ubyte
 data/EMNIST/raw/gzip.zip
+data/EMNIST/raw/gzip
 
 emnist_env
+.venv

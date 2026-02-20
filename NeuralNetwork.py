@@ -29,11 +29,11 @@ class NeuralNetwork(nn.Module):
         criterion = nn.CrossEntropyLoss() if loss_function is None else loss_function
         optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=1e-4) if optimizer is None else optimizer
 
-        for epoch in range(epochs):
+        for epoch in tqdm(range(epochs)):
             # --Training--
             self.train()
             running_loss = 0.0
-            for X_batch, y_batch in tqdm(train_loader):
+            for X_batch, y_batch in train_loader:
                 logits = self(X_batch)
                 loss = criterion(logits, y_batch)
 
@@ -70,7 +70,7 @@ class NeuralNetwork(nn.Module):
         all_preds = []
 
         with torch.no_grad():
-            for X_batch, y_batch in test_loader:
+            for X_batch, y_batch in tqdm(test_loader):
                 logits = self(X_batch)
                 preds = logits.argmax(dim=1)
                 all_preds.append(preds)
@@ -82,7 +82,7 @@ class NeuralNetwork(nn.Module):
         total = 0
 
         with torch.no_grad():
-            for X_batch, y_batch in data_loader:
+            for X_batch, y_batch in tqdm(data_loader):
                 logits = self(X_batch)
                 preds = logits.argmax(dim=1)
                 correct += (preds == y_batch).sum().item()
