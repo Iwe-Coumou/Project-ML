@@ -90,4 +90,16 @@ class NeuralNetwork(nn.Module):
 
         return correct/total
 
+    def get_activations(self, X):
+        self.eval()
+        with torch.no_grad():
+            activations = {}
 
+            X = self.flatten(X)
+            activations['flatten'] = X
+
+            for name, layer in self.linear_relu_stack.named_children():
+                X = layer(X)
+                activations[name] = X
+
+        return activations
