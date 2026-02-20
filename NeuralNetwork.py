@@ -111,4 +111,45 @@ class NeuralNetwork(nn.Module):
 
         return correct/total
 
-    
+    def get_activations(self, X):
+        """
+        Returns activations for each layer.
+        X: either a single input tensor (1 batch/sample) or a DataLoader
+        Returns: dict of layer_name -> tensor (single input) or concatenated tensor (DataLoader)
+        """
+        self.eval()
+        activations = {}
+
+        # Prepare layer names
+        layer_names = ['flatten'] + [f'layer_{i}_{layer.__class__.__name__}' 
+                                    for i, layer in enumerate(self.linear_relu_stack)]
+
+        # Case 1: DataLoader
+        if isinstance(X, torch.utils.data.DataLoader):
+            # Initialize lists for each layer
+            for name in layer_names:
+                activations[name] = []
+
+            with torch.no_grad():
+                for batch, _ in tqdm(X, desc="Collecting activations", leave=True):
+                    out = self.flatten(batch)
+                    activations['flatten'].append(out)
+
+                    for idx, layer in enumerate(self.linear_relu_stack):
+                        out = layer(out)
+                        activations[f'layer_{idx}_{layer.__class__.__name__}'].append(out)
+
+            # Concatenate all batches
+            for name in activations:
+                activations[name] = torch.cat(activations[name], dim=0)
+
+        # Case 2: Single tensor
+        else:
+            with torch.no_grad():
+                out = self.flatten(X)
+                activations['flatten'] = out
+                for idx, layer in enumerate(self.linear_relu_stack):
+                    out = layer(out)
+                    activations[f'layer_{idx}_{layer.__class__.__name__}'] = out
+
+        return activations
