@@ -30,7 +30,7 @@ class NeuralNetwork(nn.Module):
         logits = self.layer_stack(X)
         return logits
 
-    def train_model(self, train_loader, val_loader=None, epochs=10, lr=0.01, loss_function=None, optimizer=None):
+    def train_model(self, train_loader, val_loader=None, epochs=10, lr=0.01, loss_function=None, optimizer=None, l1_lambda=1e-5):
         criterion = nn.CrossEntropyLoss() if loss_function is None else loss_function
         optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=1e-4) if optimizer is None else optimizer
 
@@ -51,7 +51,8 @@ class NeuralNetwork(nn.Module):
                     y_batch = y_batch.to(self.device)
 
                     logits = self(X_batch)
-                    loss = criterion(logits, y_batch)
+                    l1_norm = sum(p.abs().sum() for p in self.parameters())
+                    loss = criterion(logits, y_batch) + l1_lambda * l1_norm
 
                     optimizer.zero_grad()
                     loss.backward()
