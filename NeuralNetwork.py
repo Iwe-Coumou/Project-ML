@@ -40,12 +40,12 @@ class NeuralNetwork(nn.Module):
 
         metrics = []
         for epoch in range(epochs):
-            # --Training--
-            self.train()
             running_loss = 0.0
 
             with tqdm(total=total_steps, desc=f"Epoch {epoch+1}/{epochs}") as epoch_bar:
 
+                # --Training--
+                self.train()
                 for X_batch, y_batch in train_loader:
                     X_batch = X_batch.to(self.device)
                     y_batch = y_batch.to(self.device)
@@ -224,3 +224,67 @@ class NeuralNetwork(nn.Module):
                     layer_data[layer_name]["post_activation"][0]
 
         return layer_data
+    
+    def compute_neuron_importance(self, X, alpha=0.7, type='combined'):
+        """
+        Computes importance scores for each neuron in hidden layers:
+        I(v) = alpha * activation_variance + (1 - alpha) * sum_abs_weights
+        Returns a dict: { 'layer_0': tensor of scores, ... }
+        """
+        layer_data = self.get_layer_data(X)
+        importance_scores = {}
+
+        for layer_name, data in layer_data.items():
+            weights = data['weights']       # [out_features, in_features]
+            bias = data['bias']             # [out_features]
+            post_act = data['post_activation']  # [N_samples, out_features]
+
+            # Activation-based importance (variance across samples)
+            I_act = post_act.var(dim=0)
+            if type == 'var':
+                importance_scores[layer_name] = I_act
+                continue
+
+            # Weight-based importance (sum of abs weights for each neuron)
+            I_weight = weights.abs().sum(dim=1) + bias.abs()
+            if type == 'weight':
+                importance_scores[layer_name] = I_weight
+                continue
+
+            # Combined importance
+            I = alpha * I_act + (1 - alpha) * I_weight
+            importance_scores[layer_name] = I
+
+        return importance_scores
+    
+    def prune_hidden_neurons(self, X, prune_rate=0.2, alpha=0.7):
+        """
+        Prunes only hidden layers based on neuron importance.
+        """
+        importance_scores = self.compute_neuron_importance(X, alpha=alpha)
+
+        linear_indices = [i for i, l in enumerate(self.layer_stack) if isinstance(l, nn.Linear)]
+        num_layers = len(linear_indices)
+
+        # Only hidden layers (exclude input and output)
+        hidden_linear_indices = linear_indices[0:-1] if num_layers > 1 else []
+
+        for idx, layer_idx in enumerate(hidden_linear_indices):
+            layer = self.layer_stack[layer_idx]
+            scores = importance_scores[f'layer_{idx}']
+
+            n_remove = int(prune_rate * scores.numel())
+            if n_remove == 0:
+                continue
+
+            # Indices of neurons to keep
+            keep_idx = scores.argsort(descending=True)[:-n_remove]
+
+            # Prune weights and biases
+            layer.weight.data = layer.weight.data[keep_idx, :]
+            layer.bias.data = layer.bias.data[keep_idx]
+
+            # Update next linear layer's input dimension
+            next_layer_idx = linear_indices[idx + 1]
+            next_layer = self.layer_stack[next_layer_idx]
+            next_layer.weight.data = next_layer.weight.data[:, keep_idx]
