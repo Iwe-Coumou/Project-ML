@@ -196,3 +196,23 @@ def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True):
         current_model = new_model
 
         return (best_model, best_val_acc, metrics_history)
+
+def plot_accuracy(metrics):
+    """
+    Plots training and validation accuracy over epochs.
+
+    Args:
+        metrics (pd.DataFrame): Must contain 'train_acc' and 'val_acc' columns.
+    """
+    epochs = range(1, len(metrics)+1)
+
+    plt.figure()
+    plt.plot(epochs, metrics['train_acc'], label='Train Accuracy')
+    plt.plot(epochs, metrics['val_acc'], label='Validation Accuracy')
+
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.title('Training and Validation Accuracy')
+    plt.legend()
+    plt.grid(True)
+    plt.show()

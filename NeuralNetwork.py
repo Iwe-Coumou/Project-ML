@@ -41,6 +41,8 @@ class NeuralNetwork(nn.Module):
         metrics = []
         for epoch in range(epochs):
             running_loss = 0.0
+            train_correct = 0
+            train_total = 0
 
             with tqdm(total=total_steps, desc=f"Epoch {epoch+1}/{epochs}", leave=False) as epoch_bar:
 
@@ -59,9 +61,15 @@ class NeuralNetwork(nn.Module):
                     optimizer.step()
 
                     running_loss += loss.item() * X_batch.size(0)
+                    
+                    preds = logits.argmax(dim=1)
+                    train_correct += (preds == y_batch).sum().item()
+                    train_total += y_batch.size(0)
+
                     epoch_bar.update(1)
 
                 epoch_train_loss = running_loss / len(train_loader.dataset)
+                train_acc = train_correct/train_total
 
                 # --Validation--
                 if val_loader:
@@ -89,6 +97,7 @@ class NeuralNetwork(nn.Module):
             metrics.append({
                 'epoch': epoch+1,
                 'train_loss': epoch_train_loss,
+                'train_acc': train_acc,
                 'val_loss': epoch_val_loss if val_loader else None,
                 'val_acc': val_acc if val_loader else None
             })
