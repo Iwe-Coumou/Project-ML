@@ -42,7 +42,7 @@ class NeuralNetwork(nn.Module):
         for epoch in range(epochs):
             running_loss = 0.0
 
-            with tqdm(total=total_steps, desc=f"Epoch {epoch+1}/{epochs}") as epoch_bar:
+            with tqdm(total=total_steps, desc=f"Epoch {epoch+1}/{epochs}", leave=False) as epoch_bar:
 
                 # --Training--
                 self.train()
