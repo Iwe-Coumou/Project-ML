@@ -3,6 +3,7 @@ from collections import defaultdict
 from IPython.display import clear_output
 import numpy as np
 import matplotlib.pyplot as plt
+import copy
 
 def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_loader, cluster_id, device=None, ):
     """
@@ -142,3 +143,56 @@ def plot_cluster_accuracy_bars(cluster_results, target_labels=None, n_cols=4, fi
     
     fig.tight_layout()
     plt.show()
+
+def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True):
+    max_rounds, prune_frac, regrow_frac, retrain_epochs, max_acc_drop = parameters
+    metrics_history = []
+    prune_history = []
+
+    current_model = copy.deepcopy(model)
+    best_model = copy.deepcopy(current_model)
+
+    baseline_val_acc = current_model.accuracy(val_loader)
+    best_val_acc = baseline_val_acc
+    round_idx = 0
+    use_max_rounds = False
+    while True:
+        round_idx+=1
+        clear_output(wait=True)
+        print(f"\n--- Pruning round {round_idx+1} ---")
+
+        if use_max_rounds and round_idx > max_rounds:
+            print("Reached maximum pruning rounds.")
+            break
+
+        prev_model = copy.deepcopy(current_model)
+
+        print("Getting layer data:")
+        layer_data = current_model.get_layer_data(train_loader)
+
+        importance_scores = current_model.compute_neuron_importance(layer_data=layer_data)
+        prune_history.append(importance_scores)
+
+        new_model = copy.deepcopy(current_model)
+        new_model.prune_hidden_neurons(importance_scores=importance_scores, prune_rate=prune_frac, alpha=0.7, regrow_frac=regrow_frac)
+
+        print("Retraining:")
+        metrics = new_model.train_model(train_loader, val_loader, epochs=retrain_epochs, lr=0.01)
+        metrics_history.append(metrics)
+
+        val_acc = metrics['val_acc'].iloc[-1]
+        print(f"Validation accuracy after pruning round {round_idx+1}: {val_acc:.4f}")
+
+        acc_drop = baseline_val_acc - val_acc
+        
+        if acc_drop > max_acc_drop:
+            print("Accuracy drop exceeded threshold.")
+            print("Restoring previous best model")
+            current_model = best_model
+            break
+
+        best_model = copy.deepcopy(new_model)
+        best_val_acc = val_acc
+        current_model = new_model
+
+        return (best_model, best_val_acc, metrics_history)
