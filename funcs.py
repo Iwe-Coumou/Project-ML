@@ -145,7 +145,7 @@ def plot_cluster_accuracy_bars(cluster_results, target_labels=None, n_cols=4, fi
     plt.show()
 
 def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr=0.01):
-    max_rounds, prune_frac, regrow_frac, retrain_epochs, max_acc_drop = parameters
+    max_rounds, prune_frac, prune_con_frac, regrow_frac, retrain_epochs, max_acc_drop = parameters
     prune_history = []
 
     current_model = copy.deepcopy(model)
@@ -174,7 +174,7 @@ def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr
 
         print("Pruning neurons")
         prune_counts = new_model.prune_hidden_neurons(importance_scores=importance_scores, prune_rate=prune_frac)
-        new_model.prune_connections(prune_frac=0.02)
+        new_model.prune_connections(prune_frac=prune_con_frac)
 
         new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
 
