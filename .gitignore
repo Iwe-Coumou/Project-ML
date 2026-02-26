@@ -6,3 +6,6 @@ data/EMNIST/raw/gzip
 
 emnist_env
 .venv
+
+.full_model.pth
+.pruned_model.pth
