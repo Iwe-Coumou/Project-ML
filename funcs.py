@@ -144,9 +144,8 @@ def plot_cluster_accuracy_bars(cluster_results, target_labels=None, n_cols=4, fi
     fig.tight_layout()
     plt.show()
 
-def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True):
+def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr=0.01):
     max_rounds, prune_frac, regrow_frac, retrain_epochs, max_acc_drop = parameters
-    metrics_history = []
     prune_history = []
 
     current_model = copy.deepcopy(model)
@@ -167,18 +166,30 @@ def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True):
 
         print("Getting layer data:")
         layer_data = current_model.get_layer_data(train_loader)
+
         importance_scores = current_model.compute_neuron_importance(layer_data=layer_data)
         prune_history.append(importance_scores)
 
         new_model = copy.deepcopy(current_model)
-        new_model.prune_hidden_neurons(importance_scores=importance_scores, prune_rate=prune_frac, alpha=0.7, regrow_frac=regrow_frac)
+
+        print("Pruning neurons")
+        prune_counts = new_model.prune_hidden_neurons(importance_scores=importance_scores, prune_rate=prune_frac)
+        new_model.prune_connections(prune_frac=0.02)
+
+        new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
 
         print("Retraining:")
-        metrics = new_model.train_model(train_loader, val_loader, epochs=retrain_epochs, lr=0.01)
-        metrics_history.append(metrics)
+        new_model.train_model(train_loader, val_loader, epochs=retrain_epochs, lr=lr)
 
-        val_acc = metrics['val_acc'].iloc[-1]
-        print(f"Validation accuracy after pruning round {round_idx+1}: {val_acc:.4f}")
+        print("Regrowing neurons")
+        new_model.regrow_hidden_neurons(prune_counts=prune_counts, regrow_frac=regrow_frac, regrow_std=0.01)
+
+        new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
+
+        print("Retraining")
+        new_model.train_model(train_loader, val_loader, epochs=2, lr=lr)
+
+        val_acc = new_model.accuracy(val_loader)
 
         acc_drop = baseline_val_acc - val_acc
         
@@ -192,7 +203,7 @@ def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True):
         clear_output(wait=True)
     
     best_val_acc = current_model.accuracy(val_loader)
-    return (current_model, best_val_acc, metrics_history)
+    return (current_model, best_val_acc)
 
 def plot_accuracy(metrics):
     """

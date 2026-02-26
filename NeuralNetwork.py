@@ -10,6 +10,7 @@ class NeuralNetwork(nn.Module):
     def __init__(self, input_size=28*28, hidden_sizes=[512, 256], output_size=10, device=None):
         super().__init__()
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.optimizer = None
 
         self.flatten = nn.Flatten()
         
@@ -30,29 +31,26 @@ class NeuralNetwork(nn.Module):
         logits = self.layer_stack(X)
         return logits
 
-    def train_model(self, train_loader, val_loader=None, epochs=10, lr=0.01, loss_function=None, optimizer=None, l1_lambda=1e-5, early_stop_delta=0.001, patience=3):
+    from tqdm import tqdm
+
+    def train_model(self, train_loader, val_loader=None, epochs=10, lr=0.01, loss_function=None, optimizer=None, l1_lambda=1e-5, early_stop_delta=0.001, patience=3, val_interval=5):
+        """
+        Train the model, validating every `val_interval` epochs for early stopping.
+        """
         criterion = nn.CrossEntropyLoss() if loss_function is None else loss_function
-        optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=1e-4) if optimizer is None else optimizer
-
-        n_train_batches = len(train_loader)
-        n_val_batches = len(val_loader) if val_loader else 0
-        total_steps = n_train_batches + n_val_batches
-
-        metrics = []
+        if self.optimizer is None:
+            self.optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=1e-4) if optimizer is None else optimizer
 
         best_val_acc = 0.0
         epochs_no_improve = 0
 
         for epoch in range(epochs):
             running_loss = 0.0
-            train_correct = 0
-            train_total = 0
 
-            with tqdm(total=total_steps, desc=f"Epoch {epoch+1}/{epochs}", leave=False) as epoch_bar:
-
-                # --Training--
-                self.train()
-                for X_batch, y_batch in train_loader:
+            # Training loop with tqdm
+            self.train()
+            with tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False) as train_bar:
+                for X_batch, y_batch in train_bar:
                     X_batch = X_batch.to(self.device)
                     y_batch = y_batch.to(self.device)
 
@@ -60,65 +58,41 @@ class NeuralNetwork(nn.Module):
                     l1_norm = sum(p.abs().sum() for p in self.parameters())
                     loss = criterion(logits, y_batch) + l1_lambda * l1_norm
 
-                    optimizer.zero_grad()
+                    self.optimizer.zero_grad()
                     loss.backward()
-                    optimizer.step()
+                    self.optimizer.step()
 
                     running_loss += loss.item() * X_batch.size(0)
-                    
-                    preds = logits.argmax(dim=1)
-                    train_correct += (preds == y_batch).sum().item()
-                    train_total += y_batch.size(0)
+                    train_bar.set_postfix({'loss': running_loss / ((train_bar.n+1)*X_batch.size(0))})
 
-                    epoch_bar.update(1)
-
-                epoch_train_loss = running_loss / len(train_loader.dataset)
-                train_acc = train_correct/train_total
-
-                # --Validation--
-                if val_loader:
-                    self.eval()
-                    correct = 0
-                    total = 0
-                    epoch_val_loss = 0.0
-
+            # Validation every val_interval epochs
+            if val_loader and (epoch + 1) % val_interval == 0:
+                self.eval()
+                correct = 0
+                total = 0
+                with tqdm(val_loader, desc="Validation", leave=False) as val_bar:
                     with torch.no_grad():
-                        for X_val, y_val in val_loader:
+                        for X_val, y_val in val_bar:
                             X_val = X_val.to(self.device)
                             y_val = y_val.to(self.device)
 
                             logits = self(X_val)
-                            loss = criterion(logits, y_val)
-                            epoch_val_loss += loss.item() * X_val.size(0)
                             preds = logits.argmax(dim=1)
                             correct += (preds == y_val).sum().item()
                             total += y_val.size(0)
-                            epoch_bar.update(1)
+                val_acc = correct / total
+                print(f"Epoch {epoch+1}: Validation accuracy = {val_acc:.4f}", end="")
 
-                    epoch_val_loss /= len(val_loader.dataset)
-                    val_acc = correct / total
+                if val_acc - best_val_acc > early_stop_delta:
+                    best_val_acc = val_acc
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += val_interval
 
-                    if val_acc - best_val_acc > early_stop_delta:
-                        best_val_acc = val_acc
-                        epochs_no_improve = 0
-                    else:
-                        epochs_no_improve += 1
-
-            metrics.append({
-                'epoch': epoch+1,
-                'train_loss': epoch_train_loss,
-                'train_acc': train_acc,
-                'val_loss': epoch_val_loss if val_loader else None,
-                'val_acc': val_acc if val_loader else None
-            })
-
+            # Early stopping
             if epochs_no_improve >= patience:
                 print(f"Early stopping triggered at epoch {epoch+1}")
                 break
-
-        metrics = pd.DataFrame(metrics)
-        metrics.set_index('epoch', inplace=True)
-        return metrics
 
     def predict(self, test_loader):
         self.eval()
@@ -288,65 +262,103 @@ class NeuralNetwork(nn.Module):
 
         return importance_scores
 
-
-    def prune_hidden_neurons(self, layer_data=None, X=None, prune_rate=0.2, alpha=0.7, importance_scores=None, regrow_frac=0.0, regrow_std=0.01):
+    def prune_hidden_neurons(self, importance_scores, prune_rate=0.05):
         """
-        Prunes hidden layers based on neuron importance, with optional random regrowth.
+        Prune hidden neurons based on importance scores.
 
-        Args:
-            layer_data: Precomputed layer data dict (optional)
-            X: Input tensor or DataLoader (used if layer_data is None)
-            prune_rate: Fraction of neurons to remove
-            alpha: Weight for activation variance in combined score
-            importance_scores: Precomputed importance scores (optional)
-            regrow_frac: Fraction of pruned neurons to randomly add back
-            regrow_std: Std deviation for initializing regrown neurons
+        Returns:
+            dict: {layer_idx: n_pruned}
         """
-
-        if importance_scores is None:
-            if X is None:
-                raise ValueError("Must provide X or precomputed importance_scores")
-            importance_scores = self.compute_neuron_importance(layer_data=layer_data, X=X, alpha=alpha)
-
-        # Indices of all linear layers
         linear_indices = [i for i, l in enumerate(self.layer_stack) if isinstance(l, nn.Linear)]
-        num_layers = len(linear_indices)
+        hidden_linear_indices = linear_indices[:-1]  # exclude output layer
 
-        # Only hidden layers (exclude last output layer)
-        hidden_linear_indices = linear_indices[0:-1] if num_layers > 1 else []
+        prune_counts = {}
 
         for idx, layer_idx in enumerate(hidden_linear_indices):
             layer = self.layer_stack[layer_idx]
             scores = importance_scores[f'layer_{idx}']
 
-            n_remove = int(prune_rate * scores.numel())
+            n_neurons = scores.numel()
+            n_remove = int(prune_rate * n_neurons)
             if n_remove == 0:
                 continue
 
-            # --- Determine which neurons to keep ---
             keep_idx = scores.argsort(descending=True)[:-n_remove]
 
-            # --- Prune current layer ---
+            # Prune current layer
             layer.weight.data = layer.weight.data[keep_idx, :]
             layer.bias.data = layer.bias.data[keep_idx]
 
-            # --- Update next layer weights for kept neurons only ---
-            next_layer_idx = linear_indices[idx + 1]
-            next_layer = self.layer_stack[next_layer_idx]
+            # Adjust next layer input weights
+            next_layer = self.layer_stack[linear_indices[idx + 1]]
             next_layer.weight.data = next_layer.weight.data[:, keep_idx]
 
-            # --- Optional random regrowth ---
-            if regrow_frac > 0:
-                n_regrow = max(1, int(n_remove * regrow_frac))
-                in_features = layer.weight.size(1)  # after pruning
-                out_features_next = next_layer.weight.size(0)
+            # Record how many neurons were pruned
+            prune_counts[layer_idx] = n_remove
 
-                # New neurons for current layer
-                new_weights = torch.randn(n_regrow, in_features, device=layer.weight.device) * regrow_std
-                new_bias = torch.randn(n_regrow, device=layer.bias.device) * regrow_std
-                layer.weight.data = torch.cat([layer.weight.data, new_weights], dim=0)
-                layer.bias.data = torch.cat([layer.bias.data, new_bias], dim=0)
+        return prune_counts
 
-                # New corresponding columns for next layer
-                new_input_weights = torch.randn(out_features_next, n_regrow, device=next_layer.weight.device) * regrow_std
-                next_layer.weight.data = torch.cat([next_layer.weight.data, new_input_weights], dim=1)
+    
+    def regrow_hidden_neurons(self, prune_counts=None, regrow_frac=0.1, regrow_std=0.01):
+        """
+        Automatically regrow neurons in all hidden layers.
+
+        Args:
+            prune_counts: dict {layer_idx: n_pruned} from last pruning step. 
+                        If None, uses current layer size * regrow_frac.
+            regrow_frac: fraction of neurons to regrow
+            regrow_std: std for initializing weights/bias
+        """
+        linear_indices = [i for i, l in enumerate(self.layer_stack) if isinstance(l, nn.Linear)]
+        hidden_linear_indices = linear_indices[:-1] if len(linear_indices) > 1 else []
+
+        for idx, layer_idx in enumerate(hidden_linear_indices):
+            layer = self.layer_stack[layer_idx]
+            next_layer = self.layer_stack[linear_indices[idx+1]]
+
+            # Determine how many neurons to regrow
+            if prune_counts is not None and layer_idx in prune_counts:
+                n_regrow = max(1, int(prune_counts[layer_idx] * regrow_frac))
+            else:
+                n_regrow = max(1, int(layer.weight.size(0) * regrow_frac))
+
+            in_features = layer.weight.size(1)
+            out_features_next = next_layer.weight.size(0)
+
+            # New neurons
+            new_weights = torch.randn(n_regrow, in_features, device=layer.weight.device) * regrow_std
+            new_bias = torch.randn(n_regrow, device=layer.bias.device) * regrow_std
+            layer.weight.data = torch.cat([layer.weight.data, new_weights], dim=0)
+            layer.bias.data = torch.cat([layer.bias.data, new_bias], dim=0)
+
+            # Corresponding columns in next layer
+            new_input_weights = torch.randn(out_features_next, n_regrow, device=next_layer.weight.device) * regrow_std
+            next_layer.weight.data = torch.cat([next_layer.weight.data, new_input_weights], dim=1)
+
+    def prune_connections(self, prune_frac=0.05):
+        """
+        Magnitude-based pruning of connections in all hidden layers.
+        Does NOT remove neurons.
+
+        Args:
+            prune_frac: fraction of weights to prune per layer
+        """
+        # All linear layers except output
+        linear_indices = [i for i, l in enumerate(self.layer_stack) if isinstance(l, nn.Linear)]
+        hidden_linear_indices = linear_indices[:-1]
+
+        for layer_idx in hidden_linear_indices:
+            layer = self.layer_stack[layer_idx]
+            W = layer.weight.data
+            n_total = W.numel()
+            n_prune = int(prune_frac * n_total)
+            if n_prune == 0:
+                continue
+
+            # Flatten weights, find threshold
+            W_flat = W.abs().view(-1)
+            threshold, _ = torch.kthvalue(W_flat, n_prune)
+
+            # Zero out weights below threshold
+            mask = W.abs() >= threshold
+            layer.weight.data *= mask.float()
