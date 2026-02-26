@@ -276,104 +276,38 @@ def compute_cluster_selectivity(cluster_map, all_activation, labels, n_classes=1
 
     return results
 
-def compute_class_conditional_prototypes_with_diff(cluster_id, cluster_map, all_activations, images, labels, top_frac=0.1, use_class_mean_diff=True):
+def plot_cluster_prototypes_and_diff_all(all_prototypes):
     """
-    Compute prototypes and difference maps for all digits for a single cluster.
+    Plot prototypes and difference maps for all clusters.
 
     Args:
-        cluster_id: int, the cluster to compute
-        cluster_map: dict {cluster_id: list of neuron indices}
-        all_activations: tensor (N_samples, total_neurons)
-        images: tensor (N_samples, 1, 28, 28)
-        labels: tensor (N_samples,)
-        top_frac: fraction of top-activating samples to average
-        use_class_mean_diff: if True, difference map relative to class mean, else global mean
-
-    Returns:
-        dict: digit -> {'prototype': 28x28 array, 'diff_map': 28x28 array}
+        all_prototypes: dict {cluster_id: {'prototype': 28x28 array, 'diff_map': 28x28 array}}
     """
-    cluster_indices = cluster_map[cluster_id]
-    cluster_acts = all_activations[:, cluster_indices]
-    cluster_strength = cluster_acts.mean(dim=1)
+    n_clusters = len(all_prototypes)
+    fig, axes = plt.subplots(2, n_clusters, figsize=(n_clusters*2, 4))
 
-    N_samples = images.shape[0]
-    flat_images = images.view(N_samples, -1)
-
-    # Precompute global mean if needed
-    if not use_class_mean_diff:
-        global_mean = flat_images.mean(dim=0).view(28,28)
-        global_mean = (global_mean - global_mean.min()) / (global_mean.max() - global_mean.min() + 1e-8)
-        global_mean_np = global_mean.cpu().numpy()
-
-    prototypes = {}
-
-    for digit in range(10):
-        mask = (labels == digit)
-        digit_strength = cluster_strength[mask]
-        digit_images = images[mask]
-
-        if len(digit_strength) == 0:
-            continue
-
-        # Top-k averaging
-        k = max(1, int(top_frac * len(digit_strength)))
-        _, top_idx = torch.topk(digit_strength, k)
-
-        proto = digit_images[top_idx].mean(dim=0).squeeze()
-        proto = (proto - proto.min()) / (proto.max() - proto.min() + 1e-8)
-        proto_np = proto.cpu().numpy()
-
-        # Difference map
-        if use_class_mean_diff:
-            class_mean = digit_images.mean(dim=0).squeeze()
-            class_mean = (class_mean - class_mean.min()) / (class_mean.max() - class_mean.min() + 1e-8)
-            mean_np = class_mean.cpu().numpy()
-        else:
-            mean_np = global_mean_np
-
-        diff_map = proto_np - mean_np
-        diff_map = (diff_map - diff_map.min()) / (diff_map.max() - diff_map.min() + 1e-8)
-
-        prototypes[digit] = {
-            'prototype': proto_np,
-            'diff_map': diff_map
-        }
-
-    return prototypes
-
-def plot_cluster_prototypes_and_diff(cluster_id, prototypes_dict):
-    """
-    Plot prototypes and difference maps for a single cluster.
-
-    Args:
-        cluster_id: int, the cluster ID
-        prototypes_dict: dict {digit: {'prototype': 28x28 array, 'diff_map': 28x28 array}}
-    """
-    n_digits = len(prototypes_dict)
-    fig, axes = plt.subplots(2, n_digits, figsize=(n_digits*1.8, 4))
-
-    for i, digit in enumerate(sorted(prototypes_dict.keys())):
-        proto = prototypes_dict[digit]['prototype']
-        diff = prototypes_dict[digit]['diff_map']
+    for i, cluster_id in enumerate(sorted(all_prototypes.keys())):
+        proto = all_prototypes[cluster_id]['prototype']
+        diff = all_prototypes[cluster_id]['diff_map']
 
         # Top row = prototype
-        ax_top = axes[0, i]
+        ax_top = axes[0, i] if n_clusters > 1 else axes[0]
         ax_top.imshow(proto, cmap='viridis')
         ax_top.axis('off')
         if i == 0:
             ax_top.set_ylabel('Prototype', fontsize=10)
 
         # Bottom row = diff map
-        ax_bottom = axes[1, i]
+        ax_bottom = axes[1, i] if n_clusters > 1 else axes[1]
         ax_bottom.imshow(diff, cmap='viridis')
         ax_bottom.axis('off')
         if i == 0:
             ax_bottom.set_ylabel('Diff Map', fontsize=10)
 
-        # Column title = digit
-        ax_top.set_title(str(digit), fontsize=10)
+        # Column title = cluster ID
+        ax_top.set_title(f'Cluster {cluster_id}', fontsize=10)
 
-    plt.suptitle(f'Cluster {cluster_id} - Prototypes & Difference Maps', fontsize=12)
+    plt.suptitle('All Clusters - Prototypes & Difference Maps', fontsize=12)
     plt.tight_layout()
     plt.show()
 
@@ -414,3 +348,58 @@ def plot_cluster_prob_distribution(selectivity_results, cluster_id):
     plt.ylabel('Probability')
     plt.title(f'Cluster {cluster_id} Class Probability Distribution')
     plt.show()
+
+def compute_prototypes_all_clusters(cluster_map, all_activations, images, top_frac=0.1, use_global_mean=True):
+    """
+    Compute prototypes and difference maps for all clusters across all images (no class stratification).
+
+    Args:
+        cluster_map: dict {cluster_id: list of neuron indices}
+        all_activations: tensor (N_samples, total_neurons)
+        images: tensor (N_samples, 1, 28, 28)
+        top_frac: fraction of top-activating samples to average
+        use_global_mean: if True, difference map relative to global mean, else cluster mean
+
+    Returns:
+        dict: cluster_id -> {'prototype': 28x28 array, 'diff_map': 28x28 array}
+    """
+    N_samples = images.shape[0]
+    flat_images = images.view(N_samples, -1)
+
+    # Precompute global mean if needed
+    if use_global_mean:
+        global_mean = flat_images.mean(dim=0).view(28,28)
+        global_mean = (global_mean - global_mean.min()) / (global_mean.max() - global_mean.min() + 1e-8)
+        global_mean_np = global_mean.cpu().numpy()
+
+    all_prototypes = {}
+
+    for cluster_id, cluster_indices in cluster_map.items():
+        cluster_acts = all_activations[:, cluster_indices]
+        cluster_strength = cluster_acts.mean(dim=1)
+
+        # Top-k averaging across all samples
+        k = max(1, int(top_frac * len(cluster_strength)))
+        _, top_idx = torch.topk(cluster_strength, k)
+
+        proto = images[top_idx].mean(dim=0).squeeze()
+        proto = (proto - proto.min()) / (proto.max() - proto.min() + 1e-8)
+        proto_np = proto.cpu().numpy()
+
+        # Difference map
+        if use_global_mean:
+            mean_np = global_mean_np
+        else:
+            cluster_mean = images.mean(dim=0).squeeze()
+            cluster_mean = (cluster_mean - cluster_mean.min()) / (cluster_mean.max() - cluster_mean.min() + 1e-8)
+            mean_np = cluster_mean.cpu().numpy()
+
+        diff_map = proto_np - mean_np
+        diff_map = (diff_map - diff_map.min()) / (diff_map.max() - diff_map.min() + 1e-8)
+
+        all_prototypes[cluster_id] = {
+            'prototype': proto_np,
+            'diff_map': diff_map
+        }
+
+    return all_prototypes

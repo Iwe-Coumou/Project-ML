@@ -30,7 +30,7 @@ class NeuralNetwork(nn.Module):
         logits = self.layer_stack(X)
         return logits
 
-    def train_model(self, train_loader, val_loader=None, epochs=10, lr=0.01, loss_function=None, optimizer=None, l1_lambda=1e-5):
+    def train_model(self, train_loader, val_loader=None, epochs=10, lr=0.01, loss_function=None, optimizer=None, l1_lambda=1e-5, early_stop_delta=0.001, patience=3):
         criterion = nn.CrossEntropyLoss() if loss_function is None else loss_function
         optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=1e-4) if optimizer is None else optimizer
 
@@ -39,6 +39,10 @@ class NeuralNetwork(nn.Module):
         total_steps = n_train_batches + n_val_batches
 
         metrics = []
+
+        best_val_acc = 0.0
+        epochs_no_improve = 0
+
         for epoch in range(epochs):
             running_loss = 0.0
             train_correct = 0
@@ -94,6 +98,12 @@ class NeuralNetwork(nn.Module):
                     epoch_val_loss /= len(val_loader.dataset)
                     val_acc = correct / total
 
+                    if val_acc - best_val_acc > early_stop_delta:
+                        best_val_acc = val_acc
+                        epochs_no_improve = 0
+                    else:
+                        epochs_no_improve += 1
+
             metrics.append({
                 'epoch': epoch+1,
                 'train_loss': epoch_train_loss,
@@ -101,6 +111,10 @@ class NeuralNetwork(nn.Module):
                 'val_loss': epoch_val_loss if val_loader else None,
                 'val_acc': val_acc if val_loader else None
             })
+
+            if epochs_no_improve >= patience:
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                break
 
         metrics = pd.DataFrame(metrics)
         metrics.set_index('epoch', inplace=True)
@@ -202,12 +216,13 @@ class NeuralNetwork(nn.Module):
 
         return activations
     
-    def get_layer_data(self, X):
+    def get_layer_data(self, X, include_output_layer=False):
         """
         Returns combined layer data: weights, biases, pre/post activations.
         
         Args:
             X: tensor or DataLoader for computing activations.
+            include_output_layer: if False, exclude the last layer (logits)
             
         Returns:
             dict: { 'layer_0': {weights, bias, pre_activation, post_activation}, ... }
@@ -220,7 +235,11 @@ class NeuralNetwork(nn.Module):
 
         # 3. Merge the two dicts
         layer_data = {}
-        for layer_name in layer_params:
+        layer_names = sorted(layer_params.keys())  # ensures proper order
+        if not include_output_layer:
+            layer_names = layer_names[:-1]  # exclude last layer
+
+        for layer_name in layer_names:
             layer_data[layer_name] = {**layer_params[layer_name], **layer_activations[layer_name]}
 
         return layer_data
