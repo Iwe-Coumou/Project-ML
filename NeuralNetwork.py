@@ -20,7 +20,6 @@ class NeuralNetwork(nn.Module):
         layers.append(nn.Linear(in_size, output_size))
         
         self.layer_stack = nn.Sequential(*layers)
-        self.connection_masks = None
 
         self.to(self.device)
 
@@ -58,7 +57,7 @@ class NeuralNetwork(nn.Module):
                 self.optimizer.step()
 
                 # --- Enforce permanent connection pruning ---
-                if hasattr(self, "connection_masks"):
+                if hasattr(self, "connection_masks") and self.connection_masks is not None:
                     for layer_idx, mask in self.connection_masks.items():
                         layer = self.layer_stack[layer_idx]
                         layer.weight.data *= mask
@@ -307,11 +306,12 @@ class NeuralNetwork(nn.Module):
             next_layer_idx = linear_indices[idx + 1]
             if hasattr(self, 'connection_masks') and next_layer_idx in self.connection_masks:
                 self.connection_masks[next_layer_idx] = self.connection_masks[next_layer_idx][:, keep_idx]
-
-        for layer_idx, mask in self.connection_masks.items():
-            layer = self.layer_stack[layer_idx]
-            assert mask.shape == layer.weight.shape, \
-                f"Mask mismatch at layer {layer_idx}: mask {mask.shape} vs weight {layer.weight.shape}"
+        
+        if hasattr(self, "connection_masks") and self.connection_masks is not None:
+            for layer_idx, mask in self.connection_masks.items() :
+                layer = self.layer_stack[layer_idx]
+                assert mask.shape == layer.weight.shape, \
+                    f"Mask mismatch at layer {layer_idx}: mask {mask.shape} vs weight {layer.weight.shape}"
 
         return prune_counts
 
@@ -372,10 +372,11 @@ class NeuralNetwork(nn.Module):
 
             self.connection_masks[layer_idx] = mask
 
-        for layer_idx, mask in self.connection_masks.items():
-            layer = self.layer_stack[layer_idx]
-            assert mask.shape == layer.weight.shape, \
-                f"Mask mismatch at layer {layer_idx}: mask {mask.shape} vs weight {layer.weight.shape}"
+        if hasattr(self, "connection_masks") and self.connection_masks is not None:
+            for layer_idx, mask in self.connection_masks.items():
+                layer = self.layer_stack[layer_idx]
+                assert mask.shape == layer.weight.shape, \
+                    f"Mask mismatch at layer {layer_idx}: mask {mask.shape} vs weight {layer.weight.shape}"
 
     def prune_connections(self, prune_frac=0.05):
         linear_indices = [i for i, l in enumerate(self.layer_stack) if isinstance(l, nn.Linear)]
@@ -416,7 +417,8 @@ class NeuralNetwork(nn.Module):
             # 5. Apply mask
             layer.weight.data *= combined_mask
 
-        for layer_idx, mask in self.connection_masks.items():
-            layer = self.layer_stack[layer_idx]
-            assert mask.shape == layer.weight.shape, \
-                f"Mask mismatch at layer {layer_idx}: mask {mask.shape} vs weight {layer.weight.shape}"
+        if hasattr(self, "connection_masks") and self.connection_masks is not None:
+            for layer_idx, mask in self.connection_masks.items():
+                layer = self.layer_stack[layer_idx]
+                assert mask.shape == layer.weight.shape, \
+                    f"Mask mismatch at layer {layer_idx}: mask {mask.shape} vs weight {layer.weight.shape}"

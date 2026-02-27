@@ -6,20 +6,7 @@ import matplotlib.pyplot as plt
 import copy
 from torch import nn
 
-def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_loader, cluster_id, device=None, ):
-    """
-    Computes per-class impact of ablating a neuron cluster using model.predict.
-
-    Args:
-        model: trained NeuralNetwork instance
-        cluster_indices: list of global neuron indices in the cluster
-        layer_mapping: list of tuples [(layer_name, start_idx, end_idx), ...]
-        data_loader: DataLoader for evaluation
-        device: torch device
-
-    Returns:
-        class_acc_drop: dict {class_label: accuracy_drop}
-    """
+def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_loader, cluster_id, device=None):
     device = device or model.device
     model.eval()
 
@@ -31,9 +18,9 @@ def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_lo
 
     clear_output(wait=True)
     print(f"\n--- Calculating pre and post-ablation accuracy for cluster {cluster_id} ---")
+
     # Original predictions and per-class accuracy
-    orig_preds = model.predict(data_loader)
-    orig_preds = orig_preds.to(device)
+    orig_preds = model.predict(data_loader).to(device)
 
     class_total = defaultdict(int)
     class_correct = defaultdict(int)
@@ -43,14 +30,12 @@ def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_lo
             class_correct[int(t)] += 1
     orig_acc_per_class = {cls: class_correct[cls]/class_total[cls] for cls in class_total}
 
-    # Backup weights/biases
+    # Backup ALL layers (current and next)
     linear_indices = [i for i, l in enumerate(model.layer_stack) if isinstance(l, torch.nn.Linear)]
     layer_backups = {}
-    for layer_name, start_idx, end_idx in layer_mapping:
-        layer_idx = int(layer_name.split('_')[1])
-        linear_layer_idx = linear_indices[layer_idx]
+    for linear_layer_idx in linear_indices:
         layer = model.layer_stack[linear_layer_idx]
-        layer_backups[layer_name] = {
+        layer_backups[linear_layer_idx] = {
             'weight': layer.weight.data.clone(),
             'bias': layer.bias.data.clone()
         }
@@ -68,7 +53,6 @@ def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_lo
         layer.weight.data[local_indices, :] = 0
         layer.bias.data[local_indices] = 0
 
-        # Zero out next layer input weights
         if layer_idx + 1 < len(linear_indices):
             next_layer = model.layer_stack[linear_indices[layer_idx + 1]]
             next_layer.weight.data[:, local_indices] = 0
@@ -81,13 +65,11 @@ def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_lo
             class_correct_after[int(t)] += 1
     acc_per_class_after = {cls: class_correct_after[cls]/class_total[cls] for cls in class_total}
 
-    # Restore weights/biases
-    for layer_name in layer_backups:
-        layer_idx = int(layer_name.split('_')[1])
-        linear_layer_idx = linear_indices[layer_idx]
+    # Restore ALL layers
+    for linear_layer_idx, backup in layer_backups.items():
         layer = model.layer_stack[linear_layer_idx]
-        layer.weight.data = layer_backups[layer_name]['weight']
-        layer.bias.data = layer_backups[layer_name]['bias']
+        layer.weight.data = backup['weight']
+        layer.bias.data = backup['bias']
 
     return {
         'pre': orig_acc_per_class,
