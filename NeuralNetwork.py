@@ -1,10 +1,7 @@
-import os
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
-from tqdm import tqdm
-import pandas as pd
+from tqdm.notebook import tqdm
 
 class NeuralNetwork(nn.Module):
     def __init__(self, input_size=28*28, hidden_sizes=[512, 256], output_size=10, device=None):
@@ -31,8 +28,6 @@ class NeuralNetwork(nn.Module):
         logits = self.layer_stack(X)
         return logits
 
-    from tqdm import tqdm
-
     def train_model(self, train_loader, val_loader=None, epochs=10, lr=0.01, loss_function=None, optimizer=None, l1_lambda=1e-5, early_stop_delta=0.001, patience=3, val_interval=5):
         """
         Train the model, validating every `val_interval` epochs for early stopping.
@@ -44,44 +39,47 @@ class NeuralNetwork(nn.Module):
         best_val_acc = 0.0
         epochs_no_improve = 0
 
-        for epoch in range(epochs):
-            running_loss = 0.0
-
+        epoch_bar = tqdm(range(epochs), desc='Training', leave=False, unit='epoch')
+        for epoch in epoch_bar:
             # Training loop with tqdm
             self.train()
-            with tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False) as train_bar:
-                for X_batch, y_batch in train_bar:
-                    X_batch = X_batch.to(self.device)
-                    y_batch = y_batch.to(self.device)
+            train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False, unit="batches", colour='green')
+            for X_batch, y_batch in train_bar:
+                X_batch = X_batch.to(self.device)
+                y_batch = y_batch.to(self.device)
 
-                    logits = self(X_batch)
-                    l1_norm = sum(p.abs().sum() for p in self.parameters())
-                    loss = criterion(logits, y_batch) + l1_lambda * l1_norm
+                logits = self(X_batch)
+                l1_norm = sum(p.abs().sum() for p in self.parameters())
+                loss = criterion(logits, y_batch) + l1_lambda * l1_norm
 
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    self.optimizer.step()
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
 
-                    running_loss += loss.item() * X_batch.size(0)
-                    train_bar.set_postfix({'loss': running_loss / ((train_bar.n+1)*X_batch.size(0))})
+                # --- Enforce permanent connection pruning ---
+                if hasattr(self, "connection_masks"):
+                    for layer_idx, mask in self.connection_masks.items():
+                        layer = self.layer_stack[layer_idx]
+                        layer.weight.data *= mask
 
             # Validation every val_interval epochs
             if val_loader and (epoch + 1) % val_interval == 0:
                 self.eval()
                 correct = 0
                 total = 0
-                with tqdm(val_loader, desc="Validation", leave=False) as val_bar:
-                    with torch.no_grad():
-                        for X_val, y_val in val_bar:
-                            X_val = X_val.to(self.device)
-                            y_val = y_val.to(self.device)
 
-                            logits = self(X_val)
-                            preds = logits.argmax(dim=1)
-                            correct += (preds == y_val).sum().item()
-                            total += y_val.size(0)
+                val_bar = tqdm(val_loader, desc="Validation", leave=False, unit='batches', colour='green')
+                with torch.no_grad():
+                    for X_val, y_val in val_bar:
+                        X_val = X_val.to(self.device)
+                        y_val = y_val.to(self.device)
+
+                        logits = self(X_val)
+                        preds = logits.argmax(dim=1)
+                        correct += (preds == y_val).sum().item()
+                        total += y_val.size(0)
                 val_acc = correct / total
-                print(f"Epoch {epoch+1}: Validation accuracy = {val_acc:.4f}", end="")
+                epoch_bar.set_postfix({'val_acc': f'{val_acc:.4f}'})
 
                 if val_acc - best_val_acc > early_stop_delta:
                     best_val_acc = val_acc
@@ -99,7 +97,7 @@ class NeuralNetwork(nn.Module):
         all_preds = []
 
         with torch.no_grad():
-            for X_batch, y_batch in tqdm(test_loader):
+            for X_batch, y_batch in tqdm(test_loader, leave=False, colour='green'):
                 X_batch = X_batch.to(self.device)
                 y_batch = y_batch.to(self.device)
 
@@ -114,7 +112,7 @@ class NeuralNetwork(nn.Module):
         total = 0
 
         with torch.no_grad():
-            for X_batch, y_batch in tqdm(data_loader):
+            for X_batch, y_batch in tqdm(data_loader, leave=True, colour='green'):
                 X_batch = X_batch.to(self.device)
                 y_batch = y_batch.to(self.device)
 
@@ -159,7 +157,7 @@ class NeuralNetwork(nn.Module):
                 activations[f'layer_{layer_num}'] = {'pre_activation': [], 'post_activation': []}
 
         with torch.no_grad():
-            for batch, _ in tqdm(iterator):
+            for batch, _ in tqdm(iterator, leave=False, colour='green'):
                 batch = batch.to(self.device)
                 out = self.flatten(batch)
                 logical_layer = 0
@@ -299,41 +297,60 @@ class NeuralNetwork(nn.Module):
         return prune_counts
 
     
-    def regrow_hidden_neurons(self, prune_counts=None, regrow_frac=0.1, regrow_std=0.01):
+    def regrow_hidden_neurons(self, regrow_counts, regrow_std=0.01):
         """
-        Automatically regrow neurons in all hidden layers.
+        Regrow neurons in hidden layers.
 
         Args:
-            prune_counts: dict {layer_idx: n_pruned} from last pruning step. 
-                        If None, uses current layer size * regrow_frac.
-            regrow_frac: fraction of neurons to regrow
-            regrow_std: std for initializing weights/bias
+            regrow_counts: dict {layer_idx: n_regrow}
+            regrow_std: std for initializing new weights/bias
         """
-        linear_indices = [i for i, l in enumerate(self.layer_stack) if isinstance(l, nn.Linear)]
+        linear_indices = [i for i, l in enumerate(self.layer_stack)
+                        if isinstance(l, nn.Linear)]
         hidden_linear_indices = linear_indices[:-1] if len(linear_indices) > 1 else []
 
         for idx, layer_idx in enumerate(hidden_linear_indices):
-            layer = self.layer_stack[layer_idx]
-            next_layer = self.layer_stack[linear_indices[idx+1]]
 
-            # Determine how many neurons to regrow
-            if prune_counts is not None and layer_idx in prune_counts:
-                n_regrow = max(1, int(prune_counts[layer_idx] * regrow_frac))
-            else:
-                n_regrow = max(1, int(layer.weight.size(0) * regrow_frac))
+            if layer_idx not in regrow_counts:
+                continue
+
+            n_regrow = regrow_counts[layer_idx]
+            if n_regrow <= 0:
+                continue
+
+            layer = self.layer_stack[layer_idx]
+            next_layer = self.layer_stack[linear_indices[idx + 1]]
 
             in_features = layer.weight.size(1)
             out_features_next = next_layer.weight.size(0)
 
-            # New neurons
-            new_weights = torch.randn(n_regrow, in_features, device=layer.weight.device) * regrow_std
-            new_bias = torch.randn(n_regrow, device=layer.bias.device) * regrow_std
+            device = layer.weight.device
+
+            # --- Add new neurons to current layer ---
+            new_weights = torch.randn(n_regrow, in_features, device=device) * regrow_std
+            new_bias = torch.randn(n_regrow, device=device) * regrow_std
+
             layer.weight.data = torch.cat([layer.weight.data, new_weights], dim=0)
             layer.bias.data = torch.cat([layer.bias.data, new_bias], dim=0)
 
-            # Corresponding columns in next layer
-            new_input_weights = torch.randn(out_features_next, n_regrow, device=next_layer.weight.device) * regrow_std
+            # --- Add corresponding input columns in next layer ---
+            new_input_weights = torch.randn(out_features_next, n_regrow, device=device) * regrow_std
             next_layer.weight.data = torch.cat([next_layer.weight.data, new_input_weights], dim=1)
+
+        for layer_idx, mask in self.connection_masks.items():
+            layer = self.layer_stack[layer_idx]
+
+            n_new_rows = layer.weigth.shape[0] - mask.shape[0]
+            n_new_cols = layer.weigth.shape[1] - mask.shape[1]
+
+            if n_new_rows > 0:
+                mask = torch.cat([mask, torch.ones(n_new_rows, mask.shape[1], device=mask.device)], dim=0)
+            
+            if n_new_cols > 0:
+                mask = torch.cat([mask, torch.ones(mask.shape[0], n_new_cols, device=mask.device)], dim=1)
+
+            self.connection_masks[layer_idx] = mask
+
 
     def prune_connections(self, prune_frac=0.05):
         """
@@ -347,6 +364,9 @@ class NeuralNetwork(nn.Module):
         linear_indices = [i for i, l in enumerate(self.layer_stack) if isinstance(l, nn.Linear)]
         hidden_linear_indices = linear_indices[:-1]
 
+        if not hasattr(self, 'connection_masks'):
+            self.connection_masks = {}
+
         for layer_idx in hidden_linear_indices:
             layer = self.layer_stack[layer_idx]
             W = layer.weight.data
@@ -355,10 +375,15 @@ class NeuralNetwork(nn.Module):
             if n_prune == 0:
                 continue
 
-            # Flatten weights, find threshold
             W_flat = W.abs().view(-1)
             threshold, _ = torch.kthvalue(W_flat, n_prune)
+            new_mask = (W.abs() >= threshold).float().to(W.device)
 
-            # Zero out weights below threshold
-            mask = W.abs() >= threshold
-            layer.weight.data *= mask.float()
+            # Combine with previous mask if it exists
+            if layer_idx in self.connection_masks:
+                combined_mask = self.connection_masks[layer_idx] * new_mask
+            else:
+                combined_mask = new_mask
+
+            layer.weight.data *= combined_mask
+            self.connection_masks[layer_idx] = combined_mask

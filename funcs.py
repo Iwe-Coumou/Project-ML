@@ -4,6 +4,7 @@ from IPython.display import clear_output
 import numpy as np
 import matplotlib.pyplot as plt
 import copy
+from torch import nn
 
 def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_loader, cluster_id, device=None, ):
     """
@@ -144,66 +145,130 @@ def plot_cluster_accuracy_bars(cluster_results, target_labels=None, n_cols=4, fi
     fig.tight_layout()
     plt.show()
 
-def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr=0.01):
+def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr=0.01, mode="full", min_width=5,):
     max_rounds, prune_frac, prune_con_frac, regrow_frac, retrain_epochs, max_acc_drop = parameters
-    prune_history = []
 
     current_model = copy.deepcopy(model)
-
     baseline_val_acc = current_model.accuracy(val_loader)
-    best_val_acc = baseline_val_acc
 
     round_idx = 0
+
     while True:
-        round_idx+=1
+        round_idx += 1
         print(f"\n--- Pruning round {round_idx} ---")
 
+        # 1. Hard round limit
         if use_max_rounds and round_idx >= max_rounds:
             print("Reached maximum pruning rounds.")
             break
 
         prev_model = copy.deepcopy(current_model)
-
-        print("Getting layer data:")
         layer_data = current_model.get_layer_data(train_loader)
-
         importance_scores = current_model.compute_neuron_importance(layer_data=layer_data)
-        prune_history.append(importance_scores)
 
         new_model = copy.deepcopy(current_model)
+        prune_counts = None
+        regrow_counts = None
 
-        print("Pruning neurons")
-        prune_counts = new_model.prune_hidden_neurons(importance_scores=importance_scores, prune_rate=prune_frac)
-        new_model.prune_connections(prune_frac=prune_con_frac)
+        # 2. Pruning neurons
+        if mode in ["full", "neuron_only", "prune_only"]:
+            prune_counts = new_model.prune_hidden_neurons(
+                importance_scores=importance_scores,
+                prune_rate=prune_frac,
+            )
 
-        new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
+        # 3. Pruning connections
+        if mode in ["full", "connections_only", "prune_only"]:
+            new_model.prune_connections(prune_frac=prune_con_frac)
 
-        print("Retraining:")
-        new_model.train_model(train_loader, val_loader, epochs=retrain_epochs, lr=lr)
+        # 4. Retrain after pruning if applicable
+        if mode in ["full", "neuron_only", "prune_only"]:
+            new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
+            print("Retraining after pruning...")
+            new_model.train_model(
+                train_loader,
+                val_loader,
+                epochs=retrain_epochs,
+                lr=lr,
+                val_interval=1,
+            )
 
-        print("Regrowing neurons")
-        new_model.regrow_hidden_neurons(prune_counts=prune_counts, regrow_frac=regrow_frac, regrow_std=0.01)
+        # 5. Regrowth
+        if mode in ["full", "neuron_only", "regrow_only"]:
+            # Compute regrow counts
+            if prune_counts is not None:
+                regrow_counts = compute_regrow_from_pruned(prune_counts, regrow_frac)
+            else:
+                # growth-only mode: compute based on current width
+                regrow_counts = compute_regrow_from_width(new_model, regrow_frac)
 
-        new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
+            if sum(regrow_counts.values()) > 0:
+                new_model.regrow_hidden_neurons(regrow_counts, regrow_std=0.01)
+                new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
+                print("Retraining after regrowth...")
+                new_model.train_model(
+                    train_loader,
+                    val_loader,
+                    epochs=2,
+                    lr=lr,
+                    val_interval=1,
+                )
 
-        print("Retraining")
-        new_model.train_model(train_loader, val_loader, epochs=2, lr=lr)
+        # 6. Structural stopping checks
+        for layer in new_model.layer_stack:
+            if isinstance(layer, torch.nn.Linear) and layer.out_features < min_width:
+                print("Minimum width reached. Stopping.")
+                return prev_model, prev_model.accuracy(val_loader)
 
-        val_acc = new_model.accuracy(val_loader)
-
-        acc_drop = baseline_val_acc - val_acc
-        
-        if acc_drop > max_acc_drop:
-            print("Accuracy drop exceeded threshold.")
-            print("Restoring previous model")
-            current_model = prev_model
+        prev_size = sum(p.numel() for p in prev_model.parameters())
+        new_size = sum(p.numel() for p in new_model.parameters())
+        if prev_size == new_size:
+            print("Model size unchanged. Converged.")
             break
 
+        # 7. Accuracy stopping condition
+        val_acc = new_model.accuracy(val_loader)
+        print(f"Validation accuracy: {val_acc:.4f}")
+        if baseline_val_acc - val_acc > max_acc_drop:
+            print("Accuracy drop exceeded threshold. Restoring previous model.")
+            return prev_model, prev_model.accuracy(val_loader)
+
+        # 8. Accept round
         current_model = new_model
         clear_output(wait=True)
-    
-    best_val_acc = current_model.accuracy(val_loader)
-    return (current_model, best_val_acc)
+
+    return current_model, current_model.accuracy(val_loader)
+
+def compute_regrow_from_pruned(prune_counts, regrow_frac):
+    """
+    Args:
+        prune_counts: dict {layer_name: n_pruned}
+        regrow_frac: float in [0,1]
+
+    Returns:
+        dict {layer_name: n_regrow}
+    """
+    regrow_counts = {}
+
+    for layer, n_pruned in prune_counts.items():
+        n_regrow = int(regrow_frac * n_pruned)
+        regrow_counts[layer] = n_regrow
+
+    return regrow_counts
+
+def compute_regrow_from_width(model, regrow_frac):
+    """
+    Regrow a percentage of current neurons per hidden layer.
+    """
+    regrow_counts = {}
+
+    for name, layer in model.named_modules():
+        if isinstance(layer, torch.nn.Linear) and name != "output_layer":
+            current_width = layer.out_features
+            n_regrow = int(regrow_frac * current_width)
+            regrow_counts[name] = n_regrow
+
+    return regrow_counts
 
 def plot_accuracy(metrics):
     """
