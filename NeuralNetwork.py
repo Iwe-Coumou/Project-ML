@@ -20,6 +20,7 @@ class NeuralNetwork(nn.Module):
         layers.append(nn.Linear(in_size, output_size))
         
         self.layer_stack = nn.Sequential(*layers)
+        self.connection_masks = None
 
         self.to(self.device)
 
@@ -49,7 +50,7 @@ class NeuralNetwork(nn.Module):
                 y_batch = y_batch.to(self.device)
 
                 logits = self(X_batch)
-                l1_norm = sum(p.abs().sum() for p in self.parameters())
+                l1_norm = torch.stack([p.abs().sum() for p in self.parameters()]).sum()
                 loss = criterion(logits, y_batch) + l1_lambda * l1_norm
 
                 self.optimizer.zero_grad()
@@ -91,6 +92,11 @@ class NeuralNetwork(nn.Module):
             if epochs_no_improve >= patience:
                 print(f"Early stopping triggered at epoch {epoch+1}")
                 break
+
+        if val_loader:
+            return val_acc
+        else:
+            return None
 
     def predict(self, test_loader):
         self.eval()
@@ -294,6 +300,19 @@ class NeuralNetwork(nn.Module):
             # Record how many neurons were pruned
             prune_counts[layer_idx] = n_remove
 
+            if hasattr(self, 'connection_masks') and layer_idx in self.connection_masks:
+                self.connection_masks[layer_idx] = self.connection_masks[layer_idx][keep_idx, :]
+
+            # After pruning next layer's input weights
+            next_layer_idx = linear_indices[idx + 1]
+            if hasattr(self, 'connection_masks') and next_layer_idx in self.connection_masks:
+                self.connection_masks[next_layer_idx] = self.connection_masks[next_layer_idx][:, keep_idx]
+
+        for layer_idx, mask in self.connection_masks.items():
+            layer = self.layer_stack[layer_idx]
+            assert mask.shape == layer.weight.shape, \
+                f"Mask mismatch at layer {layer_idx}: mask {mask.shape} vs weight {layer.weight.shape}"
+
         return prune_counts
 
     
@@ -337,11 +356,13 @@ class NeuralNetwork(nn.Module):
             new_input_weights = torch.randn(out_features_next, n_regrow, device=device) * regrow_std
             next_layer.weight.data = torch.cat([next_layer.weight.data, new_input_weights], dim=1)
 
+        if not hasattr(self, "connection_masks"):
+            return
         for layer_idx, mask in self.connection_masks.items():
             layer = self.layer_stack[layer_idx]
 
-            n_new_rows = layer.weigth.shape[0] - mask.shape[0]
-            n_new_cols = layer.weigth.shape[1] - mask.shape[1]
+            n_new_rows = layer.weight.shape[0] - mask.shape[0]
+            n_new_cols = layer.weight.shape[1] - mask.shape[1]
 
             if n_new_rows > 0:
                 mask = torch.cat([mask, torch.ones(n_new_rows, mask.shape[1], device=mask.device)], dim=0)
@@ -351,39 +372,51 @@ class NeuralNetwork(nn.Module):
 
             self.connection_masks[layer_idx] = mask
 
+        for layer_idx, mask in self.connection_masks.items():
+            layer = self.layer_stack[layer_idx]
+            assert mask.shape == layer.weight.shape, \
+                f"Mask mismatch at layer {layer_idx}: mask {mask.shape} vs weight {layer.weight.shape}"
 
     def prune_connections(self, prune_frac=0.05):
-        """
-        Magnitude-based pruning of connections in all hidden layers.
-        Does NOT remove neurons.
-
-        Args:
-            prune_frac: fraction of weights to prune per layer
-        """
-        # All linear layers except output
         linear_indices = [i for i, l in enumerate(self.layer_stack) if isinstance(l, nn.Linear)]
         hidden_linear_indices = linear_indices[:-1]
 
-        if not hasattr(self, 'connection_masks'):
+        if not hasattr(self, "connection_masks"):
             self.connection_masks = {}
 
         for layer_idx in hidden_linear_indices:
             layer = self.layer_stack[layer_idx]
             W = layer.weight.data
-            n_total = W.numel()
-            n_prune = int(prune_frac * n_total)
-            if n_prune == 0:
-                continue
 
+            # 1. Compute new magnitude mask on active weights only
             W_flat = W.abs().view(-1)
-            threshold, _ = torch.kthvalue(W_flat, n_prune)
-            new_mask = (W.abs() >= threshold).float().to(W.device)
+            W_active = W_flat[W_flat != 0]
+            if W_active.numel() == 0:
+                continue
+            n_prune = max(1, int(prune_frac * W_active.numel()))
+            threshold, _ = torch.kthvalue(W_active, n_prune)
+            new_mask = (W.abs() >= threshold).float()
 
-            # Combine with previous mask if it exists
-            if layer_idx in self.connection_masks:
-                combined_mask = self.connection_masks[layer_idx] * new_mask
-            else:
-                combined_mask = new_mask
+            # 2. Get old mask or initialize
+            old_mask = self.connection_masks.get(layer_idx, torch.ones_like(W, device=W.device))
 
-            layer.weight.data *= combined_mask
+            # 3. Extend old mask to current W shape
+            if old_mask.shape != W.shape:
+                if old_mask.shape[0] < W.shape[0]:
+                    n_new_rows = W.shape[0] - old_mask.shape[0]
+                    old_mask = torch.cat([old_mask, torch.ones(n_new_rows, old_mask.shape[1], device=W.device)], dim=0)
+                if old_mask.shape[1] < W.shape[1]:
+                    n_new_cols = W.shape[1] - old_mask.shape[1]
+                    old_mask = torch.cat([old_mask, torch.ones(old_mask.shape[0], n_new_cols, device=W.device)], dim=1)
+
+            # 4. Combine masks
+            combined_mask = old_mask * new_mask
             self.connection_masks[layer_idx] = combined_mask
+
+            # 5. Apply mask
+            layer.weight.data *= combined_mask
+
+        for layer_idx, mask in self.connection_masks.items():
+            layer = self.layer_stack[layer_idx]
+            assert mask.shape == layer.weight.shape, \
+                f"Mask mismatch at layer {layer_idx}: mask {mask.shape} vs weight {layer.weight.shape}"

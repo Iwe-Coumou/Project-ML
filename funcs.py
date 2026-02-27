@@ -158,7 +158,7 @@ def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr
         print(f"\n--- Pruning round {round_idx} ---")
 
         # 1. Hard round limit
-        if use_max_rounds and round_idx >= max_rounds:
+        if use_max_rounds and round_idx > max_rounds:
             print("Reached maximum pruning rounds.")
             break
 
@@ -185,7 +185,7 @@ def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr
         if mode in ["full", "neuron_only", "prune_only"]:
             new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
             print("Retraining after pruning...")
-            new_model.train_model(
+            val_acc = new_model.train_model(
                 train_loader,
                 val_loader,
                 epochs=retrain_epochs,
@@ -206,7 +206,7 @@ def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr
                 new_model.regrow_hidden_neurons(regrow_counts, regrow_std=0.01)
                 new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
                 print("Retraining after regrowth...")
-                new_model.train_model(
+                val_acc = new_model.train_model(
                     train_loader,
                     val_loader,
                     epochs=2,
@@ -218,26 +218,26 @@ def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr
         for layer in new_model.layer_stack:
             if isinstance(layer, torch.nn.Linear) and layer.out_features < min_width:
                 print("Minimum width reached. Stopping.")
-                return prev_model, prev_model.accuracy(val_loader)
+                return prev_model
 
         prev_size = sum(p.numel() for p in prev_model.parameters())
         new_size = sum(p.numel() for p in new_model.parameters())
         if prev_size == new_size:
             print("Model size unchanged. Converged.")
-            break
+            return prev_model
 
         # 7. Accuracy stopping condition
-        val_acc = new_model.accuracy(val_loader)
         print(f"Validation accuracy: {val_acc:.4f}")
         if baseline_val_acc - val_acc > max_acc_drop:
             print("Accuracy drop exceeded threshold. Restoring previous model.")
-            return prev_model, prev_model.accuracy(val_loader)
+            return prev_model
 
         # 8. Accept round
         current_model = new_model
         clear_output(wait=True)
 
-    return current_model, current_model.accuracy(val_loader)
+    print(f"Returning model with accuracy: {current_model.accuracy(val_loader):.4f}")
+    return current_model
 
 def compute_regrow_from_pruned(prune_counts, regrow_frac):
     """
