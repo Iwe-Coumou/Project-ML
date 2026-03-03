@@ -35,8 +35,10 @@ N_RETRAIN_EPOCHS = 3
 
 # %%
 # Create model and train
+print("=== Training initial model ===")
 model = NeuralNetwork(hidden_sizes=HIDDEN_LAYERS, device=device)
 baseline_acc = model.train_model(train_loader=train_loader, epochs=N_TRAIN_EPOCHS)
+print(f"Initial training done. baseline_acc: {baseline_acc:.4f}")
 
 # %% [markdown]
 # ## Prune Neurons and Retrain
@@ -47,12 +49,15 @@ baseline_acc = model.train_model(train_loader=train_loader, epochs=N_TRAIN_EPOCH
 # %%
 import pandas as pd
 
+print("\n=== Hyperparameter search ===")
 original_params = sum(p.numel() for p in model.parameters())
 search_results = []
 
 for prune_frac in [0.05, 0.10, 0.15, 0.20]:
+    print(f"\n--- Search: prune_frac={prune_frac} ---")
     params = (MAX_PRUNE_ROUNDS, prune_frac, prune_frac * 2, prune_frac * 0.5, N_RETRAIN_EPOCHS, MAX_ALLOWED_ACC_DROP)
     candidate = funcs.pruning(copy.deepcopy(model), train_loader, params, baseline_acc, use_max_rounds=True, mode='full')
+    print("Evaluating candidate on val_loader...")
     val_acc = candidate.accuracy(val_loader)
     n_params = sum(p.numel() for p in candidate.parameters())
     search_results.append({
@@ -68,15 +73,17 @@ print(f"\nBest prune_frac: {best_prune_frac}")
 print(pd.DataFrame(search_results).to_string())
 
 # %%
+print(f"\n=== Final pruning run (prune_frac={best_prune_frac}) ===")
 prune_parameters = (MAX_PRUNE_ROUNDS, best_prune_frac, best_prune_frac * 2, best_prune_frac * 0.5, N_RETRAIN_EPOCHS, MAX_ALLOWED_ACC_DROP)
 use_max_rounds = False if device.type == "cuda" else True
 
 final_model = funcs.pruning(model, train_loader, prune_parameters, baseline_acc, use_max_rounds=use_max_rounds, mode='full')
 
 # %%
+print("Evaluating final model...")
 print(f"Test accuracy after pruning: {final_model.accuracy(val_loader):.2f}")
 
 # %%
+print("Saving model...")
 torch.save(final_model, "pruned_model.pth")
-
-
+print("Done.")

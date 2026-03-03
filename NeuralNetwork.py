@@ -52,6 +52,7 @@ class NeuralNetwork(nn.Module):
 
         best_val_acc = 0.0
         epochs_no_improve = 0
+        val_acc = 0.0
 
         epoch_bar = tqdm(range(epochs), desc='Training', leave=False, unit='epoch')
         for epoch in epoch_bar:
