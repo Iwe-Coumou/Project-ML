@@ -116,12 +116,10 @@ def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr
         if mode in ["full", "neuron_only", "prune_only"]:
             new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
             print("Retraining after pruning...")
-            val_acc = new_model.train_model(
+            new_model.train_model(
                 train_loader,
-                val_loader,
                 epochs=retrain_epochs,
                 lr=lr,
-                val_interval=1,
             )
 
         # 5. Regrowth
@@ -137,12 +135,10 @@ def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr
                 new_model.regrow_hidden_neurons(regrow_counts, regrow_std=0.01)
                 new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
                 print("Retraining after regrowth...")
-                val_acc = new_model.train_model(
+                new_model.train_model(
                     train_loader,
-                    val_loader,
                     epochs=2,
                     lr=lr,
-                    val_interval=1,
                 )
 
         # 6. Structural stopping checks
@@ -158,6 +154,7 @@ def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr
             return prev_model
 
         # 7. Accuracy stopping condition
+        val_acc = new_model.accuracy(val_loader)
         print(f"Validation accuracy: {val_acc:.4f}")
         if baseline_val_acc - val_acc > max_acc_drop:
             print("Accuracy drop exceeded threshold. Restoring previous model.")
@@ -200,6 +197,101 @@ def compute_regrow_from_width(model, regrow_frac):
             regrow_counts[name] = n_regrow
 
     return regrow_counts
+
+def cluster_neurons(layer_data, n_clusters, mode='full', nmf_subsample=15000):
+    """
+    Cluster neurons in a model using NMF on their activation patterns.
+
+    Args:
+        layer_data:    dict from model.get_layer_data(), keys like 'layer_0', 'layer_1', ...
+                       each value has {'post_activation': tensor [N, n_neurons]}
+        n_clusters:    number of clusters
+        mode:          'full'      — cluster all neurons together across the whole model
+                       'per_layer' — cluster each layer independently
+        nmf_subsample: max samples used to fit NMF (subsampled randomly if exceeded)
+
+    Returns:
+        cluster_map:           {cluster_id: [global_neuron_indices]}
+        layer_mapping:         [(layer_name, start_idx, end_idx), ...]
+        all_neuron_activations: tensor [N_samples, total_neurons]
+    """
+    from sklearn.decomposition import NMF
+
+    hidden_layers = [k for k in layer_data.keys() if 'layer_' in k]
+
+    layer_mapping = []
+    start_idx = 0
+    for layer_name in hidden_layers:
+        n_neurons = layer_data[layer_name]['post_activation'].shape[1]
+        layer_mapping.append((layer_name, start_idx, start_idx + n_neurons))
+        start_idx += n_neurons
+
+    all_neuron_activations = torch.cat(
+        [layer_data[ln]['post_activation'] for ln in hidden_layers], dim=1
+    )
+
+    cluster_map = defaultdict(list)
+
+    def _fit_nmf(activations_np, k):
+        if activations_np.shape[0] > nmf_subsample:
+            rng = np.random.default_rng(42)
+            idx = rng.choice(activations_np.shape[0], size=nmf_subsample, replace=False)
+            fit_data = activations_np[idx]
+        else:
+            fit_data = activations_np
+        nmf = NMF(n_components=k, random_state=42, max_iter=500)
+        nmf.fit(fit_data)
+        return nmf.components_  # [k, n_neurons]
+
+    if mode == 'full':
+        H = _fit_nmf(all_neuron_activations.numpy(), n_clusters)
+        for neuron_idx, cluster_id in enumerate(H.argmax(axis=0)):
+            cluster_map[int(cluster_id) + 1].append(neuron_idx)
+
+    elif mode == 'per_layer':
+        cluster_offset = 0
+        for layer_name, start, end in layer_mapping:
+            layer_acts = layer_data[layer_name]['post_activation'].numpy()
+            k = min(n_clusters, layer_acts.shape[1])
+            H = _fit_nmf(layer_acts, k)
+            for local_idx, local_cluster in enumerate(H.argmax(axis=0)):
+                global_id = cluster_offset + int(local_cluster) + 1
+                cluster_map[global_id].append(start + local_idx)
+            cluster_offset += k
+
+    else:
+        raise ValueError(f"Unknown mode {mode!r}. Use 'full' or 'per_layer'.")
+
+    total_neurons = sum(end - start for _, start, end in layer_mapping)
+    print(f"Clustered {total_neurons} neurons into {len(cluster_map)} clusters (mode='{mode}')")
+
+    return cluster_map, layer_mapping, all_neuron_activations
+
+
+def split_clusters_by_layer(cluster_map, layer_mapping):
+    """
+    Groups a flat cluster_map by layer. Only meaningful after per_layer clustering,
+    where each cluster's neurons all belong to a single layer.
+
+    Args:
+        cluster_map:   {cluster_id: [global_neuron_indices]}
+        layer_mapping: [(layer_name, start_idx, end_idx), ...]
+
+    Returns:
+        {layer_name: {cluster_id: [global_neuron_indices]}}
+    """
+    result = {layer_name: {} for layer_name, _, _ in layer_mapping}
+
+    for cluster_id, neuron_indices in cluster_map.items():
+        # In per_layer mode all neurons in a cluster share the same layer
+        global_idx = neuron_indices[0]
+        for layer_name, start, end in layer_mapping:
+            if start <= global_idx < end:
+                result[layer_name][cluster_id] = neuron_indices
+                break
+
+    return result
+
 
 def compute_cluster_selectivity(cluster_map, all_activation, labels, n_classes=10):
     results = {}

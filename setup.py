@@ -18,7 +18,7 @@ MIN_VAL_ACC = 0.9
 N_RETRIAN_EPOCHS = 3
 
 # clustering
-N_CLUSTERS = 15
+N_CLUSTERS = 10
 
 
 def get_device():
@@ -58,7 +58,10 @@ def get_dataloaders(batch_size=BATCH_SIZE):
 
     train_size = int(TRAIN_VAL_SPLIT * len(train_dataset))
     val_size = len(train_dataset) - train_size
-    train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
+    train_dataset, val_dataset = random_split(
+        train_dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
+    )
     print(f"train size: {train_size}, val size: {val_size}, test size: {len(test_dataset)}")
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)

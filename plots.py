@@ -2,6 +2,69 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
+def plot_first_layer_weights(model, layer_data=None, sort_by='weight_norm', top_n=None, n_cols=8):
+    """
+    Visualises each neuron in the first hidden layer as a 28x28 image of its
+    input weights, showing what pattern in the input each neuron responds to.
+
+    Uses a diverging colourmap centred at zero since weights can be negative
+    (red = strongly negative, blue = strongly positive).
+
+    Args:
+        model:     NeuralNetwork instance
+        layer_data: dict from model.get_layer_data(), required for sort_by='activation_variance'
+        sort_by:   'weight_norm'          — sort by L2 norm of weight vector (no data needed)
+                   'activation_variance'  — sort by variance of activations across the dataset
+                                            (requires layer_data)
+                   'cv'                   — coefficient of variation (std / mean); normalises out
+                                            overall firing rate so high CV means truly selective,
+                                            not just highly active (requires layer_data)
+        top_n:     if set, only plot the top N neurons by the chosen score
+        n_cols:    number of columns in the grid
+    """
+    import torch
+
+    first_layer = next(l for l in model.layer_stack if isinstance(l, torch.nn.Linear))
+    weights = first_layer.weight.data.cpu().numpy()  # [n_neurons, 784]
+
+    if sort_by == 'weight_norm':
+        scores = np.linalg.norm(weights, axis=1)
+    elif sort_by in ('activation_variance', 'cv'):
+        if layer_data is None:
+            raise ValueError(f"layer_data is required for sort_by='{sort_by}'")
+        acts = layer_data['layer_0']['post_activation'].numpy()  # [N_samples, n_neurons]
+        if sort_by == 'activation_variance':
+            scores = acts.var(axis=0)
+        else:
+            scores = acts.std(axis=0) / (acts.mean(axis=0) + 1e-8)
+    else:
+        raise ValueError(f"Unknown sort_by {sort_by!r}. Use 'weight_norm', 'activation_variance', or 'cv'.")
+
+    order = np.argsort(scores)[::-1]
+    if top_n is not None:
+        order = order[:top_n]
+
+    n_plot = len(order)
+    n_rows = (n_plot + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 1.8, n_rows * 1.8))
+    axes = np.array(axes).flatten()
+
+    for i in range(len(axes)):
+        ax = axes[i]
+        if i < n_plot:
+            neuron_idx = order[i]
+            w = weights[neuron_idx].reshape(28, 28)
+            vmax = np.abs(w).max()
+            ax.imshow(w, cmap='RdBu_r', vmin=-vmax, vmax=vmax)
+            ax.set_title(f'n{neuron_idx}\n{scores[neuron_idx]:.2f}', fontsize=6)
+        ax.axis('off')
+
+    title = f'First layer weight maps — top {n_plot} by {sort_by}'
+    plt.suptitle(title, fontsize=12)
+    plt.tight_layout()
+    plt.show()
+
+
 def plot_cluster_accuracy_bars(cluster_results, target_labels=None, n_cols=4, figsize_per_plot=(4,3)):
     """
     Plots per-cluster pre- vs post-ablation accuracy as bars per class.

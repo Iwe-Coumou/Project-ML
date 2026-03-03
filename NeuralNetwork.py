@@ -28,10 +28,23 @@ class NeuralNetwork(nn.Module):
         logits = self.layer_stack(X)
         return logits
 
-    def train_model(self, train_loader, val_loader=None, epochs=10, lr=0.01, loss_function=None, optimizer=None, l1_lambda=1e-5, early_stop_delta=0.001, patience=3, val_interval=5):
+    def train_model(self, train_loader, val_loader=None, epochs=10, lr=0.01, loss_function=None, optimizer=None, l1_lambda=1e-5, early_stop_delta=0.001, patience=3, val_interval=5, val_split=0.1):
         """
         Train the model, validating every `val_interval` epochs for early stopping.
+        If val_loader is None and val_split > 0, a fraction of the training data is
+        split off internally for early stopping only.
         """
+        from torch.utils.data import random_split, DataLoader as _DataLoader
+
+        if val_loader is None and val_split > 0:
+            dataset = train_loader.dataset
+            n_val = int(val_split * len(dataset))
+            n_train = len(dataset) - n_val
+            train_sub, val_sub = random_split(dataset, [n_train, n_val])
+            batch_size = train_loader.batch_size
+            train_loader = _DataLoader(train_sub, batch_size=batch_size, shuffle=True)
+            val_loader = _DataLoader(val_sub, batch_size=batch_size)
+
         criterion = nn.CrossEntropyLoss() if loss_function is None else loss_function
         if self.optimizer is None:
             self.optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=1e-4) if optimizer is None else optimizer
