@@ -1,7 +1,7 @@
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
-from tqdm.notebook import tqdm
+from tqdm.auto import tqdm
 
 class NeuralNetwork(nn.Module):
     def __init__(self, input_size=28*28, hidden_sizes=[512, 256], output_size=10, device=None):
@@ -28,15 +28,16 @@ class NeuralNetwork(nn.Module):
         logits = self.layer_stack(X)
         return logits
 
-    def train_model(self, train_loader, val_loader=None, epochs=10, lr=0.01, loss_function=None, optimizer=None, l1_lambda=1e-5, early_stop_delta=0.001, patience=3, val_interval=5, val_split=0.1):
+    def train_model(self, train_loader, epochs=10, lr=0.01, loss_function=None, optimizer=None, l1_lambda=1e-5, early_stop_delta=0.001, patience=3, val_interval=5, val_split=0.1):
         """
         Train the model, validating every `val_interval` epochs for early stopping.
-        If val_loader is None and val_split > 0, a fraction of the training data is
-        split off internally for early stopping only.
+        A fraction (val_split) of the training data is split off internally for
+        early stopping only. Set val_split=0 to disable early stopping.
         """
         from torch.utils.data import random_split, DataLoader as _DataLoader
 
-        if val_loader is None and val_split > 0:
+        val_loader = None
+        if val_split > 0:
             dataset = train_loader.dataset
             n_val = int(val_split * len(dataset))
             n_train = len(dataset) - n_val
@@ -105,10 +106,7 @@ class NeuralNetwork(nn.Module):
                 print(f"Early stopping triggered at epoch {epoch+1}")
                 break
 
-        if val_loader:
-            return val_acc
-        else:
-            return None
+        return val_acc if val_split > 0 else None
 
     def predict(self, test_loader):
         self.eval()

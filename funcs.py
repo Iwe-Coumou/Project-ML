@@ -76,11 +76,11 @@ def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_lo
         'post': acc_per_class_after
     }
 
-def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr=0.01, mode="full", min_width=5,):
+def pruning(model, train_loader, parameters, baseline_acc, use_max_rounds=True, lr=0.01, mode="full", min_width=5):
     max_rounds, prune_frac, prune_con_frac, regrow_frac, retrain_epochs, max_acc_drop = parameters
 
     current_model = copy.deepcopy(model)
-    baseline_val_acc = current_model.accuracy(val_loader)
+    val_acc = baseline_acc
 
     round_idx = 0
 
@@ -116,10 +116,11 @@ def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr
         if mode in ["full", "neuron_only", "prune_only"]:
             new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
             print("Retraining after pruning...")
-            new_model.train_model(
+            val_acc = new_model.train_model(
                 train_loader,
                 epochs=retrain_epochs,
                 lr=lr,
+                val_interval=1,
             )
 
         # 5. Regrowth
@@ -135,10 +136,11 @@ def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr
                 new_model.regrow_hidden_neurons(regrow_counts, regrow_std=0.01)
                 new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
                 print("Retraining after regrowth...")
-                new_model.train_model(
+                val_acc = new_model.train_model(
                     train_loader,
                     epochs=2,
                     lr=lr,
+                    val_interval=1,
                 )
 
         # 6. Structural stopping checks
@@ -154,9 +156,8 @@ def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr
             return prev_model
 
         # 7. Accuracy stopping condition
-        val_acc = new_model.accuracy(val_loader)
         print(f"Validation accuracy: {val_acc:.4f}")
-        if baseline_val_acc - val_acc > max_acc_drop:
+        if baseline_acc - val_acc > max_acc_drop:
             print("Accuracy drop exceeded threshold. Restoring previous model.")
             return prev_model
 
@@ -164,7 +165,7 @@ def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True, lr
         current_model = new_model
         clear_output(wait=True)
 
-    print(f"Returning model with accuracy: {current_model.accuracy(val_loader):.4f}")
+    print(f"Returning model after {round_idx} rounds.")
     return current_model
 
 def compute_regrow_from_pruned(prune_counts, regrow_frac):
