@@ -1,15 +1,13 @@
-import os
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
-from tqdm import tqdm
-import pandas as pd
+from tqdm.auto import tqdm
 
 class NeuralNetwork(nn.Module):
     def __init__(self, input_size=28*28, hidden_sizes=[512, 256], output_size=10, device=None):
         super().__init__()
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.optimizer = None
 
         self.flatten = nn.Flatten()
         
@@ -30,102 +28,93 @@ class NeuralNetwork(nn.Module):
         logits = self.layer_stack(X)
         return logits
 
-    def train_model(self, train_loader, val_loader=None, epochs=10, lr=0.01, loss_function=None, optimizer=None, l1_lambda=1e-5, early_stop_delta=0.001, patience=3):
+    def train_model(self, train_loader, epochs=10, lr=0.01, loss_function=None, optimizer=None, l1_lambda=1e-5, early_stop_delta=0.001, patience=3, val_interval=5, val_split=0.1):
+        """
+        Train the model, validating every `val_interval` epochs for early stopping.
+        A fraction (val_split) of the training data is split off internally for
+        early stopping only. Set val_split=0 to disable early stopping.
+        """
+        from torch.utils.data import random_split, DataLoader as _DataLoader
+
+        val_loader = None
+        if val_split > 0:
+            dataset = train_loader.dataset
+            n_val = int(val_split * len(dataset))
+            n_train = len(dataset) - n_val
+            train_sub, val_sub = random_split(dataset, [n_train, n_val])
+            batch_size = train_loader.batch_size
+            train_loader = _DataLoader(train_sub, batch_size=batch_size, shuffle=True)
+            val_loader = _DataLoader(val_sub, batch_size=batch_size)
+
         criterion = nn.CrossEntropyLoss() if loss_function is None else loss_function
-        optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=1e-4) if optimizer is None else optimizer
-
-        n_train_batches = len(train_loader)
-        n_val_batches = len(val_loader) if val_loader else 0
-        total_steps = n_train_batches + n_val_batches
-
-        metrics = []
+        if self.optimizer is None:
+            self.optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=1e-4) if optimizer is None else optimizer
 
         best_val_acc = 0.0
         epochs_no_improve = 0
+        val_acc = 0.0
 
-        for epoch in range(epochs):
-            running_loss = 0.0
-            train_correct = 0
-            train_total = 0
+        epoch_bar = tqdm(range(epochs), desc='Training', leave=False, unit='epoch')
+        for epoch in epoch_bar:
+            # Training loop with tqdm
+            self.train()
+            train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False, unit="batches", colour='green')
+            for X_batch, y_batch in train_bar:
+                X_batch = X_batch.to(self.device)
+                y_batch = y_batch.to(self.device)
 
-            with tqdm(total=total_steps, desc=f"Epoch {epoch+1}/{epochs}", leave=False) as epoch_bar:
+                logits = self(X_batch)
+                l1_norm = torch.stack([p.abs().sum() for p in self.parameters()]).sum()
+                loss = criterion(logits, y_batch) + l1_lambda * l1_norm
 
-                # --Training--
-                self.train()
-                for X_batch, y_batch in train_loader:
-                    X_batch = X_batch.to(self.device)
-                    y_batch = y_batch.to(self.device)
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
 
-                    logits = self(X_batch)
-                    l1_norm = sum(p.abs().sum() for p in self.parameters())
-                    loss = criterion(logits, y_batch) + l1_lambda * l1_norm
+                # --- Enforce permanent connection pruning ---
+                if hasattr(self, "connection_masks") and self.connection_masks is not None:
+                    for layer_idx, mask in self.connection_masks.items():
+                        layer = self.layer_stack[layer_idx]
+                        layer.weight.data *= mask
 
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
+            # Validation every val_interval epochs
+            if val_loader and (epoch + 1) % val_interval == 0:
+                self.eval()
+                correct = 0
+                total = 0
 
-                    running_loss += loss.item() * X_batch.size(0)
-                    
-                    preds = logits.argmax(dim=1)
-                    train_correct += (preds == y_batch).sum().item()
-                    train_total += y_batch.size(0)
+                val_bar = tqdm(val_loader, desc="Validation", leave=False, unit='batches', colour='green')
+                with torch.no_grad():
+                    for X_val, y_val in val_bar:
+                        X_val = X_val.to(self.device)
+                        y_val = y_val.to(self.device)
 
-                    epoch_bar.update(1)
+                        logits = self(X_val)
+                        preds = logits.argmax(dim=1)
+                        correct += (preds == y_val).sum().item()
+                        total += y_val.size(0)
+                val_acc = correct / total
+                epoch_bar.set_postfix({'val_acc': f'{val_acc:.4f}'})
 
-                epoch_train_loss = running_loss / len(train_loader.dataset)
-                train_acc = train_correct/train_total
+                if val_acc - best_val_acc > early_stop_delta:
+                    best_val_acc = val_acc
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += val_interval
 
-                # --Validation--
-                if val_loader:
-                    self.eval()
-                    correct = 0
-                    total = 0
-                    epoch_val_loss = 0.0
-
-                    with torch.no_grad():
-                        for X_val, y_val in val_loader:
-                            X_val = X_val.to(self.device)
-                            y_val = y_val.to(self.device)
-
-                            logits = self(X_val)
-                            loss = criterion(logits, y_val)
-                            epoch_val_loss += loss.item() * X_val.size(0)
-                            preds = logits.argmax(dim=1)
-                            correct += (preds == y_val).sum().item()
-                            total += y_val.size(0)
-                            epoch_bar.update(1)
-
-                    epoch_val_loss /= len(val_loader.dataset)
-                    val_acc = correct / total
-
-                    if val_acc - best_val_acc > early_stop_delta:
-                        best_val_acc = val_acc
-                        epochs_no_improve = 0
-                    else:
-                        epochs_no_improve += 1
-
-            metrics.append({
-                'epoch': epoch+1,
-                'train_loss': epoch_train_loss,
-                'train_acc': train_acc,
-                'val_loss': epoch_val_loss if val_loader else None,
-                'val_acc': val_acc if val_loader else None
-            })
-
+            # Early stopping
             if epochs_no_improve >= patience:
                 print(f"Early stopping triggered at epoch {epoch+1}")
                 break
 
-        metrics = pd.DataFrame(metrics)
-        metrics.set_index('epoch', inplace=True)
-        return metrics
+        return val_acc if val_split > 0 else None
 
     def predict(self, test_loader):
         self.eval()
         all_preds = []
 
         with torch.no_grad():
-            for X_batch, y_batch in tqdm(test_loader):
+            for X_batch, y_batch in tqdm(test_loader, leave=False, colour='green'):
                 X_batch = X_batch.to(self.device)
                 y_batch = y_batch.to(self.device)
 
@@ -140,7 +129,7 @@ class NeuralNetwork(nn.Module):
         total = 0
 
         with torch.no_grad():
-            for X_batch, y_batch in tqdm(data_loader):
+            for X_batch, y_batch in tqdm(data_loader, leave=True, colour='green'):
                 X_batch = X_batch.to(self.device)
                 y_batch = y_batch.to(self.device)
 
@@ -185,7 +174,7 @@ class NeuralNetwork(nn.Module):
                 activations[f'layer_{layer_num}'] = {'pre_activation': [], 'post_activation': []}
 
         with torch.no_grad():
-            for batch, _ in tqdm(iterator):
+            for batch, _ in tqdm(iterator, leave=False, colour='green'):
                 batch = batch.to(self.device)
                 out = self.flatten(batch)
                 logical_layer = 0
@@ -288,65 +277,160 @@ class NeuralNetwork(nn.Module):
 
         return importance_scores
 
-
-    def prune_hidden_neurons(self, layer_data=None, X=None, prune_rate=0.2, alpha=0.7, importance_scores=None, regrow_frac=0.0, regrow_std=0.01):
+    def prune_hidden_neurons(self, importance_scores, prune_rate=0.05):
         """
-        Prunes hidden layers based on neuron importance, with optional random regrowth.
+        Prune hidden neurons based on importance scores.
 
-        Args:
-            layer_data: Precomputed layer data dict (optional)
-            X: Input tensor or DataLoader (used if layer_data is None)
-            prune_rate: Fraction of neurons to remove
-            alpha: Weight for activation variance in combined score
-            importance_scores: Precomputed importance scores (optional)
-            regrow_frac: Fraction of pruned neurons to randomly add back
-            regrow_std: Std deviation for initializing regrown neurons
+        Returns:
+            dict: {layer_idx: n_pruned}
         """
-
-        if importance_scores is None:
-            if X is None:
-                raise ValueError("Must provide X or precomputed importance_scores")
-            importance_scores = self.compute_neuron_importance(layer_data=layer_data, X=X, alpha=alpha)
-
-        # Indices of all linear layers
         linear_indices = [i for i, l in enumerate(self.layer_stack) if isinstance(l, nn.Linear)]
-        num_layers = len(linear_indices)
+        hidden_linear_indices = linear_indices[:-1]  # exclude output layer
 
-        # Only hidden layers (exclude last output layer)
-        hidden_linear_indices = linear_indices[0:-1] if num_layers > 1 else []
+        prune_counts = {}
 
         for idx, layer_idx in enumerate(hidden_linear_indices):
             layer = self.layer_stack[layer_idx]
             scores = importance_scores[f'layer_{idx}']
 
-            n_remove = int(prune_rate * scores.numel())
+            n_neurons = scores.numel()
+            n_remove = int(prune_rate * n_neurons)
             if n_remove == 0:
                 continue
 
-            # --- Determine which neurons to keep ---
             keep_idx = scores.argsort(descending=True)[:-n_remove]
 
-            # --- Prune current layer ---
+            # Prune current layer
             layer.weight.data = layer.weight.data[keep_idx, :]
             layer.bias.data = layer.bias.data[keep_idx]
 
-            # --- Update next layer weights for kept neurons only ---
-            next_layer_idx = linear_indices[idx + 1]
-            next_layer = self.layer_stack[next_layer_idx]
+            # Adjust next layer input weights
+            next_layer = self.layer_stack[linear_indices[idx + 1]]
             next_layer.weight.data = next_layer.weight.data[:, keep_idx]
 
-            # --- Optional random regrowth ---
-            if regrow_frac > 0:
-                n_regrow = max(1, int(n_remove * regrow_frac))
-                in_features = layer.weight.size(1)  # after pruning
-                out_features_next = next_layer.weight.size(0)
+            # Record how many neurons were pruned
+            prune_counts[layer_idx] = n_remove
 
-                # New neurons for current layer
-                new_weights = torch.randn(n_regrow, in_features, device=layer.weight.device) * regrow_std
-                new_bias = torch.randn(n_regrow, device=layer.bias.device) * regrow_std
-                layer.weight.data = torch.cat([layer.weight.data, new_weights], dim=0)
-                layer.bias.data = torch.cat([layer.bias.data, new_bias], dim=0)
+            if hasattr(self, 'connection_masks') and layer_idx in self.connection_masks:
+                self.connection_masks[layer_idx] = self.connection_masks[layer_idx][keep_idx, :]
 
-                # New corresponding columns for next layer
-                new_input_weights = torch.randn(out_features_next, n_regrow, device=next_layer.weight.device) * regrow_std
-                next_layer.weight.data = torch.cat([next_layer.weight.data, new_input_weights], dim=1)
+            # After pruning next layer's input weights
+            next_layer_idx = linear_indices[idx + 1]
+            if hasattr(self, 'connection_masks') and next_layer_idx in self.connection_masks:
+                self.connection_masks[next_layer_idx] = self.connection_masks[next_layer_idx][:, keep_idx]
+        
+        if hasattr(self, "connection_masks") and self.connection_masks is not None:
+            for layer_idx, mask in self.connection_masks.items() :
+                layer = self.layer_stack[layer_idx]
+                assert mask.shape == layer.weight.shape, \
+                    f"Mask mismatch at layer {layer_idx}: mask {mask.shape} vs weight {layer.weight.shape}"
+
+        return prune_counts
+
+    
+    def regrow_hidden_neurons(self, regrow_counts, regrow_std=0.01):
+        """
+        Regrow neurons in hidden layers.
+
+        Args:
+            regrow_counts: dict {layer_idx: n_regrow}
+            regrow_std: std for initializing new weights/bias
+        """
+        linear_indices = [i for i, l in enumerate(self.layer_stack)
+                        if isinstance(l, nn.Linear)]
+        hidden_linear_indices = linear_indices[:-1] if len(linear_indices) > 1 else []
+
+        for idx, layer_idx in enumerate(hidden_linear_indices):
+
+            if layer_idx not in regrow_counts:
+                continue
+
+            n_regrow = regrow_counts[layer_idx]
+            if n_regrow <= 0:
+                continue
+
+            layer = self.layer_stack[layer_idx]
+            next_layer = self.layer_stack[linear_indices[idx + 1]]
+
+            in_features = layer.weight.size(1)
+            out_features_next = next_layer.weight.size(0)
+
+            device = layer.weight.device
+
+            # --- Add new neurons to current layer ---
+            new_weights = torch.randn(n_regrow, in_features, device=device) * regrow_std
+            new_bias = torch.randn(n_regrow, device=device) * regrow_std
+
+            layer.weight.data = torch.cat([layer.weight.data, new_weights], dim=0)
+            layer.bias.data = torch.cat([layer.bias.data, new_bias], dim=0)
+
+            # --- Add corresponding input columns in next layer ---
+            new_input_weights = torch.randn(out_features_next, n_regrow, device=device) * regrow_std
+            next_layer.weight.data = torch.cat([next_layer.weight.data, new_input_weights], dim=1)
+
+        if not hasattr(self, "connection_masks"):
+            return
+        for layer_idx, mask in self.connection_masks.items():
+            layer = self.layer_stack[layer_idx]
+
+            n_new_rows = layer.weight.shape[0] - mask.shape[0]
+            n_new_cols = layer.weight.shape[1] - mask.shape[1]
+
+            if n_new_rows > 0:
+                mask = torch.cat([mask, torch.ones(n_new_rows, mask.shape[1], device=mask.device)], dim=0)
+            
+            if n_new_cols > 0:
+                mask = torch.cat([mask, torch.ones(mask.shape[0], n_new_cols, device=mask.device)], dim=1)
+
+            self.connection_masks[layer_idx] = mask
+
+        if hasattr(self, "connection_masks") and self.connection_masks is not None:
+            for layer_idx, mask in self.connection_masks.items():
+                layer = self.layer_stack[layer_idx]
+                assert mask.shape == layer.weight.shape, \
+                    f"Mask mismatch at layer {layer_idx}: mask {mask.shape} vs weight {layer.weight.shape}"
+
+    def prune_connections(self, prune_frac=0.05):
+        linear_indices = [i for i, l in enumerate(self.layer_stack) if isinstance(l, nn.Linear)]
+        hidden_linear_indices = linear_indices[:-1]
+
+        if not hasattr(self, "connection_masks"):
+            self.connection_masks = {}
+
+        for layer_idx in hidden_linear_indices:
+            layer = self.layer_stack[layer_idx]
+            W = layer.weight.data
+
+            # 1. Compute new magnitude mask on active weights only
+            W_flat = W.abs().view(-1)
+            W_active = W_flat[W_flat != 0]
+            if W_active.numel() == 0:
+                continue
+            n_prune = max(1, int(prune_frac * W_active.numel()))
+            threshold, _ = torch.kthvalue(W_active, n_prune)
+            new_mask = (W.abs() >= threshold).float()
+
+            # 2. Get old mask or initialize
+            old_mask = self.connection_masks.get(layer_idx, torch.ones_like(W, device=W.device))
+
+            # 3. Extend old mask to current W shape
+            if old_mask.shape != W.shape:
+                if old_mask.shape[0] < W.shape[0]:
+                    n_new_rows = W.shape[0] - old_mask.shape[0]
+                    old_mask = torch.cat([old_mask, torch.ones(n_new_rows, old_mask.shape[1], device=W.device)], dim=0)
+                if old_mask.shape[1] < W.shape[1]:
+                    n_new_cols = W.shape[1] - old_mask.shape[1]
+                    old_mask = torch.cat([old_mask, torch.ones(old_mask.shape[0], n_new_cols, device=W.device)], dim=1)
+
+            # 4. Combine masks
+            combined_mask = old_mask * new_mask
+            self.connection_masks[layer_idx] = combined_mask
+
+            # 5. Apply mask
+            layer.weight.data *= combined_mask
+
+        if hasattr(self, "connection_masks") and self.connection_masks is not None:
+            for layer_idx, mask in self.connection_masks.items():
+                layer = self.layer_stack[layer_idx]
+                assert mask.shape == layer.weight.shape, \
+                    f"Mask mismatch at layer {layer_idx}: mask {mask.shape} vs weight {layer.weight.shape}"

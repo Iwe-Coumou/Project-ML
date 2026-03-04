@@ -1,24 +1,11 @@
 import torch
 from collections import defaultdict
-from IPython.display import clear_output
 import numpy as np
 import matplotlib.pyplot as plt
 import copy
+from torch import nn
 
-def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_loader, cluster_id, device=None, ):
-    """
-    Computes per-class impact of ablating a neuron cluster using model.predict.
-
-    Args:
-        model: trained NeuralNetwork instance
-        cluster_indices: list of global neuron indices in the cluster
-        layer_mapping: list of tuples [(layer_name, start_idx, end_idx), ...]
-        data_loader: DataLoader for evaluation
-        device: torch device
-
-    Returns:
-        class_acc_drop: dict {class_label: accuracy_drop}
-    """
+def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_loader, cluster_id, device=None):
     device = device or model.device
     model.eval()
 
@@ -28,11 +15,10 @@ def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_lo
         all_labels.append(y)
     all_labels = torch.cat(all_labels).to(device)
 
-    clear_output(wait=True)
     print(f"\n--- Calculating pre and post-ablation accuracy for cluster {cluster_id} ---")
+
     # Original predictions and per-class accuracy
-    orig_preds = model.predict(data_loader)
-    orig_preds = orig_preds.to(device)
+    orig_preds = model.predict(data_loader).to(device)
 
     class_total = defaultdict(int)
     class_correct = defaultdict(int)
@@ -42,14 +28,12 @@ def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_lo
             class_correct[int(t)] += 1
     orig_acc_per_class = {cls: class_correct[cls]/class_total[cls] for cls in class_total}
 
-    # Backup weights/biases
+    # Backup ALL layers (current and next)
     linear_indices = [i for i, l in enumerate(model.layer_stack) if isinstance(l, torch.nn.Linear)]
     layer_backups = {}
-    for layer_name, start_idx, end_idx in layer_mapping:
-        layer_idx = int(layer_name.split('_')[1])
-        linear_layer_idx = linear_indices[layer_idx]
+    for linear_layer_idx in linear_indices:
         layer = model.layer_stack[linear_layer_idx]
-        layer_backups[layer_name] = {
+        layer_backups[linear_layer_idx] = {
             'weight': layer.weight.data.clone(),
             'bias': layer.bias.data.clone()
         }
@@ -67,7 +51,6 @@ def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_lo
         layer.weight.data[local_indices, :] = 0
         layer.bias.data[local_indices] = 0
 
-        # Zero out next layer input weights
         if layer_idx + 1 < len(linear_indices):
             next_layer = model.layer_stack[linear_indices[layer_idx + 1]]
             next_layer.weight.data[:, local_indices] = 0
@@ -80,159 +63,455 @@ def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_lo
             class_correct_after[int(t)] += 1
     acc_per_class_after = {cls: class_correct_after[cls]/class_total[cls] for cls in class_total}
 
-    # Restore weights/biases
-    for layer_name in layer_backups:
-        layer_idx = int(layer_name.split('_')[1])
-        linear_layer_idx = linear_indices[layer_idx]
+    # Restore ALL layers
+    for linear_layer_idx, backup in layer_backups.items():
         layer = model.layer_stack[linear_layer_idx]
-        layer.weight.data = layer_backups[layer_name]['weight']
-        layer.bias.data = layer_backups[layer_name]['bias']
+        layer.weight.data = backup['weight']
+        layer.bias.data = backup['bias']
 
     return {
         'pre': orig_acc_per_class,
         'post': acc_per_class_after
     }
 
-def plot_cluster_accuracy_bars(cluster_results, target_labels=None, n_cols=4, figsize_per_plot=(4,3)):
-    """
-    Plots per-cluster pre- vs post-ablation accuracy as bars per class.
-
-    Args:
-        cluster_results: dict of dicts {cluster_id: {'pre': {cls: acc}, 'post': {cls: acc}}}
-        target_labels: list of class labels in order (optional)
-        n_cols: number of columns in the grid
-        figsize_per_plot: tuple, figure size per subplot
-    """
-    n_clusters = len(cluster_results)
-    n_rows = int(np.ceil(n_clusters / n_cols))
-    
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols*figsize_per_plot[0], n_rows*figsize_per_plot[1]), squeeze=False)
-    
-    for i, (cluster_id, acc_dict) in enumerate(cluster_results.items()):
-        ax = axes[i // n_cols, i % n_cols]
-        
-        classes = sorted(acc_dict['pre'].keys()) if target_labels is None else target_labels
-        pre_acc = [acc_dict['pre'][cls] for cls in classes]
-        post_acc = [acc_dict['post'][cls] for cls in classes]
-        
-        # Draw bars from pre to post
-        for x, y_pre, y_post in zip(range(len(classes)), pre_acc, post_acc):
-            ax.plot([x, x], [y_pre, y_post], color='skyblue', lw=6, solid_capstyle='round')  # thick line as bar
-            ax.scatter(x, y_pre, color='green', label='pre' if x==0 else "", zorder=3)
-            ax.scatter(x, y_post, color='red', label='post' if x==0 else "", zorder=3)
-        
-        ax.set_xticks(range(len(classes)))
-        ax.set_xticklabels(classes, rotation=45)
-        ax.set_ylim(0,1)
-        ax.set_title(f'Cluster {cluster_id}')
-        if i == 0:
-            ax.legend()
-        
-        row = i // n_cols
-        col = i % n_cols
-        # Only leftmost column gets y-label
-        if col == 0:
-            ax.set_ylabel("Accuracy")
-        # Only bottom row gets x-label
-        if row == n_rows - 1:
-            ax.set_xlabel("Class label")
-    
-    # Hide empty subplots
-    for j in range(i+1, n_rows*n_cols):
-        fig.delaxes(axes[j//n_cols, j%n_cols])
-    
-    fig.tight_layout()
-    plt.show()
-
-def pruning(model, train_loader, val_loader, parameters, use_max_rounds=True):
-    max_rounds, prune_frac, regrow_frac, retrain_epochs, max_acc_drop = parameters
-    metrics_history = []
-    prune_history = []
+def pruning(model, train_loader, parameters, baseline_acc, use_max_rounds=True, lr=0.01, mode="full", min_width=5):
+    max_rounds, prune_frac, prune_con_frac, regrow_frac, retrain_epochs, max_acc_drop = parameters
 
     current_model = copy.deepcopy(model)
-
-    baseline_val_acc = current_model.accuracy(val_loader)
-    best_val_acc = baseline_val_acc
+    val_acc = baseline_acc
 
     round_idx = 0
+
     while True:
-        round_idx+=1
+        round_idx += 1
         print(f"\n--- Pruning round {round_idx} ---")
 
-        if use_max_rounds and round_idx >= max_rounds:
+        # 1. Hard round limit
+        if use_max_rounds and round_idx > max_rounds:
             print("Reached maximum pruning rounds.")
             break
 
         prev_model = copy.deepcopy(current_model)
-
-        print("Getting layer data:")
         layer_data = current_model.get_layer_data(train_loader)
         importance_scores = current_model.compute_neuron_importance(layer_data=layer_data)
-        prune_history.append(importance_scores)
 
         new_model = copy.deepcopy(current_model)
-        new_model.prune_hidden_neurons(importance_scores=importance_scores, prune_rate=prune_frac, alpha=0.7, regrow_frac=regrow_frac)
+        prune_counts = None
+        regrow_counts = None
 
-        print("Retraining:")
-        metrics = new_model.train_model(train_loader, val_loader, epochs=retrain_epochs, lr=0.01)
-        metrics_history.append(metrics)
+        # 2. Pruning neurons
+        if mode in ["full", "neuron_only", "prune_only"]:
+            prune_counts = new_model.prune_hidden_neurons(
+                importance_scores=importance_scores,
+                prune_rate=prune_frac,
+            )
 
-        val_acc = metrics['val_acc'].iloc[-1]
-        print(f"Validation accuracy after pruning round {round_idx+1}: {val_acc:.4f}")
+        # 3. Pruning connections
+        if mode in ["full", "connections_only", "prune_only"]:
+            new_model.prune_connections(prune_frac=prune_con_frac)
 
-        acc_drop = baseline_val_acc - val_acc
-        
-        if acc_drop > max_acc_drop:
-            print("Accuracy drop exceeded threshold.")
-            print("Restoring previous model")
-            current_model = prev_model
-            break
+        # 4. Retrain after pruning if applicable
+        if mode in ["full", "neuron_only", "prune_only"]:
+            new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
+            print("Retraining after pruning...")
+            val_acc = new_model.train_model(
+                train_loader,
+                epochs=retrain_epochs,
+                lr=lr,
+                val_interval=1,
+            )
 
+        # 5. Regrowth
+        if mode in ["full", "neuron_only", "regrow_only"]:
+            # Compute regrow counts
+            if prune_counts is not None:
+                regrow_counts = compute_regrow_from_pruned(prune_counts, regrow_frac)
+            else:
+                # growth-only mode: compute based on current width
+                regrow_counts = compute_regrow_from_width(new_model, regrow_frac)
+
+            if sum(regrow_counts.values()) > 0:
+                new_model.regrow_hidden_neurons(regrow_counts, regrow_std=0.01)
+                new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
+                print("Retraining after regrowth...")
+                val_acc = new_model.train_model(
+                    train_loader,
+                    epochs=2,
+                    lr=lr,
+                    val_interval=1,
+                )
+
+        # 6. Structural stopping checks
+        for layer in new_model.layer_stack:
+            if isinstance(layer, torch.nn.Linear) and layer.out_features < min_width:
+                print("Minimum width reached. Stopping.")
+                return prev_model
+
+        prev_size = sum(p.numel() for p in prev_model.parameters())
+        new_size = sum(p.numel() for p in new_model.parameters())
+        if prev_size == new_size:
+            print("Model size unchanged. Converged.")
+            return prev_model
+
+        # 7. Accuracy stopping condition
+        print(f"Validation accuracy: {val_acc:.4f}")
+        if baseline_acc - val_acc > max_acc_drop:
+            print("Accuracy drop exceeded threshold. Restoring previous model.")
+            return prev_model
+
+        # 8. Accept round
         current_model = new_model
-        clear_output(wait=True)
-    
-    best_val_acc = current_model.accuracy(val_loader)
-    return (current_model, best_val_acc, metrics_history)
 
-def plot_accuracy(metrics):
+    print(f"Returning model after {round_idx} rounds.")
+    return current_model
+
+def compute_regrow_from_pruned(prune_counts, regrow_frac):
     """
-    Plots training and validation accuracy over epochs.
+    Args:
+        prune_counts: dict {layer_name: n_pruned}
+        regrow_frac: float in [0,1]
+
+    Returns:
+        dict {layer_name: n_regrow}
+    """
+    regrow_counts = {}
+
+    for layer, n_pruned in prune_counts.items():
+        n_regrow = int(regrow_frac * n_pruned)
+        regrow_counts[layer] = n_regrow
+
+    return regrow_counts
+
+def compute_regrow_from_width(model, regrow_frac):
+    """
+    Regrow a percentage of current neurons per hidden layer.
+    """
+    regrow_counts = {}
+
+    for name, layer in model.named_modules():
+        if isinstance(layer, torch.nn.Linear) and name != "output_layer":
+            current_width = layer.out_features
+            n_regrow = int(regrow_frac * current_width)
+            regrow_counts[name] = n_regrow
+
+    return regrow_counts
+
+def _build_neuron_adjacency(layer_data, layer_mapping, weight_threshold=1e-10):
+    """
+    Build a sparse undirected adjacency matrix for the neuron weight graph.
+
+    Nodes are global neuron indices. Edges are non-zero weight connections between
+    neurons in adjacent layers within the subset (layers whose numbers differ by 1).
 
     Args:
-        metrics (pd.DataFrame): Must contain 'train_acc' and 'val_acc' columns.
+        layer_data:       dict with 'layer_k' keys, each having {'weights': tensor [out, in], ...}
+        layer_mapping:    [(layer_name, start_idx, end_idx), ...]
+        weight_threshold: minimum abs(weight) to count as an active connection
+
+    Returns:
+        scipy.sparse.csr_matrix of shape [total_neurons, total_neurons]
     """
-    epochs = range(1, len(metrics)+1)
+    from scipy.sparse import csr_matrix
 
-    plt.figure()
-    plt.plot(epochs, metrics['train_acc'], label='Train Accuracy')
-    plt.plot(epochs, metrics['val_acc'], label='Validation Accuracy')
+    total_neurons = layer_mapping[-1][2]
+    rows, cols = [], []
 
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.title('Training and Validation Accuracy')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    for i in range(len(layer_mapping) - 1):
+        name_k,  start_k,  _ = layer_mapping[i]
+        name_k1, start_k1, _ = layer_mapping[i + 1]
 
-def plot_loss(metrics):
+        # Only add edges for layers directly adjacent in the full network
+        if int(name_k1.split('_')[1]) - int(name_k.split('_')[1]) != 1:
+            continue
+
+        # W[j, i] = weight from neuron i in layer_k to neuron j in layer_k1
+        W = layer_data[name_k1]['weights']
+        W_np = W.numpy() if hasattr(W, 'numpy') else np.array(W)
+
+        j_idx, i_idx = np.where(np.abs(W_np) > weight_threshold)
+        g_i = start_k  + i_idx
+        g_j = start_k1 + j_idx
+
+        # Undirected: add both directions
+        rows += g_i.tolist() + g_j.tolist()
+        cols += g_j.tolist() + g_i.tolist()
+
+    data = np.ones(len(rows), dtype=np.float32)
+    adj = csr_matrix((data, (rows, cols)), shape=(total_neurons, total_neurons))
+    adj.data[:] = 1.0  # binarise (duplicate edges may sum > 1)
+    return adj
+
+
+def _merge_components_by_similarity(component_labels, n_components, n_clusters,
+                                     layer_mapping, layer_data, all_neuron_activations):
     """
-    Plots training and validation accuracy over epochs.
+    Merge connected components down to n_clusters using greedy cosine similarity.
+
+    Computes a per-component centroid as the mean activation across the dataset,
+    then iteratively merges the most similar pair until n_clusters remain.
+
+    Returns:
+        defaultdict(list) cluster_map in the same format as cluster_neurons output
+    """
+    # Map each component to its neuron indices
+    component_to_neurons = defaultdict(list)
+    for neuron_idx, comp_id in enumerate(component_labels):
+        component_to_neurons[int(comp_id)].append(neuron_idx)
+
+    acts_np = all_neuron_activations.numpy()  # [N_samples, total_neurons]
+
+    # Centroid: mean activation of the component across the dataset [N_samples]
+    centroids = {
+        comp_id: acts_np[:, indices].mean(axis=1)
+        for comp_id, indices in component_to_neurons.items()
+    }
+
+    # Greedy merge: {super_id: [comp_ids]}
+    super_components = {cid: [cid] for cid in component_to_neurons}
+    super_centroids  = {cid: centroids[cid].copy() for cid in centroids}
+    super_sizes      = {cid: len(component_to_neurons[cid]) for cid in component_to_neurons}
+
+    current_n = n_components
+    while current_n > n_clusters:
+        ids = list(super_centroids.keys())
+        best_sim, best_a, best_b = -np.inf, None, None
+
+        for a in range(len(ids)):
+            for b in range(a + 1, len(ids)):
+                id_a, id_b = ids[a], ids[b]
+                va, vb = super_centroids[id_a], super_centroids[id_b]
+                norm_a, norm_b = np.linalg.norm(va), np.linalg.norm(vb)
+                if norm_a < 1e-12 or norm_b < 1e-12:
+                    sim = 0.0
+                else:
+                    sim = np.dot(va, vb) / (norm_a * norm_b)
+                if sim > best_sim:
+                    best_sim, best_a, best_b = sim, id_a, id_b
+
+        # Merge best_b into best_a with neuron-count-weighted centroid
+        n_a, n_b = super_sizes[best_a], super_sizes[best_b]
+        super_centroids[best_a] = (
+            super_centroids[best_a] * n_a + super_centroids[best_b] * n_b
+        ) / (n_a + n_b)
+        super_sizes[best_a] = n_a + n_b
+        super_components[best_a].extend(super_components.pop(best_b))
+        del super_centroids[best_b]
+        del super_sizes[best_b]
+        current_n -= 1
+
+    # Build cluster_map (1-indexed)
+    result = defaultdict(list)
+    for cluster_id, (_, comp_ids) in enumerate(super_components.items(), start=1):
+        for comp_id in comp_ids:
+            result[cluster_id].extend(component_to_neurons[comp_id])
+    return result
+
+def cluster_neurons(layer_data, n_clusters, mode='full', nmf_subsample=15000):
+    """
+    Cluster neurons in a model using NMF on their activation patterns.
 
     Args:
-        metrics (pd.DataFrame): Must contain 'train_loss' and 'val_loss' columns.
+        layer_data:    dict from model.get_layer_data(), keys like 'layer_0', 'layer_1', ...
+                       each value has {'post_activation': tensor [N, n_neurons]}
+        n_clusters:    number of clusters
+        mode:          'full'      — cluster all neurons together across the whole model
+                       'per_layer' — cluster each layer independently
+        nmf_subsample: max samples used to fit NMF (subsampled randomly if exceeded)
+
+    Returns:
+        cluster_map:           {cluster_id: [global_neuron_indices]}
+        layer_mapping:         [(layer_name, start_idx, end_idx), ...]
+        all_neuron_activations: tensor [N_samples, total_neurons]
     """
-    epochs = range(1, len(metrics)+1)
+    from sklearn.decomposition import NMF
 
-    plt.figure()
-    plt.plot(epochs, metrics['train_loss'], label='Train loss')
-    plt.plot(epochs, metrics['val_loss'], label='Validation loss')
+    hidden_layers = [k for k in layer_data.keys() if 'layer_' in k]
 
-    plt.xlabel('Epoch')
-    plt.ylabel('loss')
-    plt.title('Training and Validation loss')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    layer_mapping = []
+    start_idx = 0
+    for layer_name in hidden_layers:
+        n_neurons = layer_data[layer_name]['post_activation'].shape[1]
+        layer_mapping.append((layer_name, start_idx, start_idx + n_neurons))
+        start_idx += n_neurons
+
+    all_neuron_activations = torch.cat(
+        [layer_data[ln]['post_activation'] for ln in hidden_layers], dim=1
+    )
+
+    cluster_map = defaultdict(list)
+
+    def _fit_nmf(activations_np, k):
+        if activations_np.shape[0] > nmf_subsample:
+            rng = np.random.default_rng(42)
+            idx = rng.choice(activations_np.shape[0], size=nmf_subsample, replace=False)
+            fit_data = activations_np[idx]
+        else:
+            fit_data = activations_np
+        nmf = NMF(n_components=k, random_state=42, max_iter=500)
+        nmf.fit(fit_data)
+        return nmf.components_  # [k, n_neurons]
+
+    if mode == 'full':
+        H = _fit_nmf(all_neuron_activations.numpy(), n_clusters)
+        for neuron_idx, cluster_id in enumerate(H.argmax(axis=0)):
+            cluster_map[int(cluster_id) + 1].append(neuron_idx)
+
+    elif mode == 'per_layer':
+        cluster_offset = 0
+        for layer_name, start, end in layer_mapping:
+            layer_acts = layer_data[layer_name]['post_activation'].numpy()
+            k = min(n_clusters, layer_acts.shape[1])
+            H = _fit_nmf(layer_acts, k)
+            for local_idx, local_cluster in enumerate(H.argmax(axis=0)):
+                global_id = cluster_offset + int(local_cluster) + 1
+                cluster_map[global_id].append(start + local_idx)
+            cluster_offset += k
+
+    else:
+        raise ValueError(f"Unknown mode {mode!r}. Use 'full' or 'per_layer'.")
+
+    total_neurons = sum(end - start for _, start, end in layer_mapping)
+    print(f"Clustered {total_neurons} neurons into {len(cluster_map)} clusters (mode='{mode}')")
+
+    return cluster_map, layer_mapping, all_neuron_activations
+
+def cluster_neurons_fabio(layer_data, n_clusters, mode='full', nmf_subsample=15000,
+                    enforce_connectivity=False, weight_threshold=1e-10):
+    """
+    Cluster neurons in a model using NMF on their activation patterns.
+
+    Args:
+        layer_data:            dict from model.get_layer_data(), keys like 'layer_0', 'layer_1', ...
+                               each value has {'weights': tensor [out, in], 'post_activation': tensor [N, out]}
+        n_clusters:            number of clusters
+        mode:                  'full'      — cluster all neurons together across the whole model
+                               'per_layer' — cluster each layer independently
+        nmf_subsample:         max samples used to fit NMF (subsampled randomly if exceeded)
+        enforce_connectivity:  if True (mode='full' only), ensures no cluster has direct weight
+                               connections to another cluster. Uses connected components of the weight
+                               graph as hard boundaries. Falls back to standard NMF if the network
+                               is fully connected (1 component). Has no effect in mode='per_layer'.
+        weight_threshold:      minimum abs(weight) to treat as an active connection (default 1e-10).
+
+    Returns:
+        cluster_map:           {cluster_id: [global_neuron_indices]}
+        layer_mapping:         [(layer_name, start_idx, end_idx), ...]
+        all_neuron_activations: tensor [N_samples, total_neurons]
+    """
+    import warnings
+    from sklearn.decomposition import NMF
+
+    hidden_layers = [k for k in layer_data.keys() if 'layer_' in k]
+
+    layer_mapping = []
+    start_idx = 0
+    for layer_name in hidden_layers:
+        n_neurons = layer_data[layer_name]['post_activation'].shape[1]
+        layer_mapping.append((layer_name, start_idx, start_idx + n_neurons))
+        start_idx += n_neurons
+
+    all_neuron_activations = torch.cat(
+        [layer_data[ln]['post_activation'] for ln in hidden_layers], dim=1
+    )
+
+    cluster_map = defaultdict(list)
+
+    def _fit_nmf(activations_np, k):
+        if activations_np.shape[0] > nmf_subsample:
+            rng = np.random.default_rng(42)
+            idx = rng.choice(activations_np.shape[0], size=nmf_subsample, replace=False)
+            fit_data = activations_np[idx]
+        else:
+            fit_data = activations_np
+        nmf = NMF(n_components=k, random_state=42, max_iter=500)
+        nmf.fit(fit_data)
+        return nmf.components_  # [k, n_neurons]
+
+    if enforce_connectivity and mode == 'per_layer':
+        warnings.warn(
+            "enforce_connectivity=True has no effect in mode='per_layer' "
+            "(constraint is only meaningful for multi-layer clustering). "
+            "Proceeding with standard per-layer NMF."
+        )
+
+    if mode == 'full':
+        if enforce_connectivity:
+            from scipy.sparse.csgraph import connected_components
+
+            adj = _build_neuron_adjacency(layer_data, layer_mapping, weight_threshold)
+            n_comp, labels = connected_components(adj, directed=False, return_labels=True)
+
+            if n_comp == 1:
+                warnings.warn(
+                    "enforce_connectivity: Network is fully connected (1 component). "
+                    "No isolated clusters exist. Falling back to standard NMF."
+                )
+                H = _fit_nmf(all_neuron_activations.numpy(), n_clusters)
+                for neuron_idx, cluster_id in enumerate(H.argmax(axis=0)):
+                    cluster_map[int(cluster_id) + 1].append(neuron_idx)
+            elif n_comp <= n_clusters:
+                if n_comp < n_clusters:
+                    warnings.warn(
+                        f"enforce_connectivity: Only {n_comp} disconnected components exist "
+                        f"(requested {n_clusters}). Using {n_comp} clusters."
+                    )
+                for neuron_idx, comp_id in enumerate(labels):
+                    cluster_map[int(comp_id) + 1].append(neuron_idx)
+            else:
+                # n_comp > n_clusters: merge by activation similarity
+                cluster_map = _merge_components_by_similarity(
+                    labels, n_comp, n_clusters,
+                    layer_mapping, layer_data, all_neuron_activations,
+                )
+        else:
+            H = _fit_nmf(all_neuron_activations.numpy(), n_clusters)
+            for neuron_idx, cluster_id in enumerate(H.argmax(axis=0)):
+                cluster_map[int(cluster_id) + 1].append(neuron_idx)
+
+    elif mode == 'per_layer':
+        cluster_offset = 0
+        for layer_name, start, end in layer_mapping:
+            layer_acts = layer_data[layer_name]['post_activation'].numpy()
+            k = min(n_clusters, layer_acts.shape[1])
+            H = _fit_nmf(layer_acts, k)
+            for local_idx, local_cluster in enumerate(H.argmax(axis=0)):
+                global_id = cluster_offset + int(local_cluster) + 1
+                cluster_map[global_id].append(start + local_idx)
+            cluster_offset += k
+
+    else:
+        raise ValueError(f"Unknown mode {mode!r}. Use 'full' or 'per_layer'.")
+
+    total_neurons = sum(end - start for _, start, end in layer_mapping)
+    print(f"Clustered {total_neurons} neurons into {len(cluster_map)} clusters (mode='{mode}')")
+
+    return cluster_map, layer_mapping, all_neuron_activations
+
+
+def split_clusters_by_layer(cluster_map, layer_mapping):
+    """
+    Groups a flat cluster_map by layer. Only meaningful after per_layer clustering,
+    where each cluster's neurons all belong to a single layer.
+
+    Args:
+        cluster_map:   {cluster_id: [global_neuron_indices]}
+        layer_mapping: [(layer_name, start_idx, end_idx), ...]
+
+    Returns:
+        {layer_name: {cluster_id: [global_neuron_indices]}}
+    """
+    result = {layer_name: {} for layer_name, _, _ in layer_mapping}
+
+    for cluster_id, neuron_indices in cluster_map.items():
+        # In per_layer mode all neurons in a cluster share the same layer
+        global_idx = neuron_indices[0]
+        for layer_name, start, end in layer_mapping:
+            if start <= global_idx < end:
+                result[layer_name][cluster_id] = neuron_indices
+                break
+
+    return result
+
 
 def compute_cluster_selectivity(cluster_map, all_activation, labels, n_classes=10):
     results = {}
@@ -276,78 +555,6 @@ def compute_cluster_selectivity(cluster_map, all_activation, labels, n_classes=1
 
     return results
 
-def plot_cluster_prototypes_and_diff_all(all_prototypes):
-    """
-    Plot prototypes and difference maps for all clusters.
-
-    Args:
-        all_prototypes: dict {cluster_id: {'prototype': 28x28 array, 'diff_map': 28x28 array}}
-    """
-    n_clusters = len(all_prototypes)
-    fig, axes = plt.subplots(2, n_clusters, figsize=(n_clusters*2, 4))
-
-    for i, cluster_id in enumerate(sorted(all_prototypes.keys())):
-        proto = all_prototypes[cluster_id]['prototype']
-        diff = all_prototypes[cluster_id]['diff_map']
-
-        # Top row = prototype
-        ax_top = axes[0, i] if n_clusters > 1 else axes[0]
-        ax_top.imshow(proto, cmap='viridis')
-        ax_top.axis('off')
-        if i == 0:
-            ax_top.set_ylabel('Prototype', fontsize=10)
-
-        # Bottom row = diff map
-        ax_bottom = axes[1, i] if n_clusters > 1 else axes[1]
-        ax_bottom.imshow(diff, cmap='viridis')
-        ax_bottom.axis('off')
-        if i == 0:
-            ax_bottom.set_ylabel('Diff Map', fontsize=10)
-
-        # Column title = cluster ID
-        ax_top.set_title(f'Cluster {cluster_id}', fontsize=10)
-
-    plt.suptitle('All Clusters - Prototypes & Difference Maps', fontsize=12)
-    plt.tight_layout()
-    plt.show()
-
-def plot_cluster_activation_heatmap(selectivity_results, n_classes=10):
-    cluster_ids = sorted(selectivity_results.keys())
-    activation_matrix = np.array([selectivity_results[c]['mean_activation_per_class'] for c in cluster_ids])
-
-    plt.figure(figsize=(10, len(cluster_ids)*0.5 + 2))
-    im = plt.imshow(activation_matrix, cmap='viridis', aspect='auto')
-    plt.colorbar(im, label='Mean Activation')
-    plt.xlabel('Digit')
-    plt.ylabel('Cluster ID')
-    plt.title('Cluster Mean Activation per Digit')
-    plt.xticks(range(n_classes))
-    plt.yticks(range(len(cluster_ids)), cluster_ids)
-    plt.show()
-
-def plot_cluster_entropy(selectivity_results):
-    cluster_ids = sorted(selectivity_results.keys())
-    entropy_values = [selectivity_results[c]['normalized_entropy'] for c in cluster_ids]
-
-    plt.figure(figsize=(10,4))
-    plt.bar(cluster_ids, entropy_values, color='steelblue')
-    plt.xlabel('Cluster ID')
-    plt.ylabel('Normalized Entropy')
-    plt.title('Cluster Selectivity (Lower = More Selective)')
-
-    plt.xticks(cluster_ids, rotation=45)
-
-    plt.show()
-
-def plot_cluster_prob_distribution(selectivity_results, cluster_id):
-    probs = selectivity_results[cluster_id]['prob_distribution']
-    plt.figure(figsize=(6,4))
-    plt.bar(range(len(probs)), probs, color='orange')
-    plt.xticks(range(len(probs)))
-    plt.xlabel('Digit')
-    plt.ylabel('Probability')
-    plt.title(f'Cluster {cluster_id} Class Probability Distribution')
-    plt.show()
 
 def compute_prototypes_all_clusters(cluster_map, all_activations, images, top_frac=0.1, use_global_mean=True):
     """

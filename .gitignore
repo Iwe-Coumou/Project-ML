@@ -9,3 +9,8 @@ emnist_env
 
 .full_model.pth
 .pruned_model.pth
+
+training_err.txt
+training_log.txt
+
+run_training.ps1
