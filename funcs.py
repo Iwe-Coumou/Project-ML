@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import copy
 from torch import nn
+from torch.utils.data import ConcatDataset, DataLoader
 
 def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_loader, cluster_id, device=None):
     device = device or model.device
@@ -74,7 +75,7 @@ def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_lo
         'post': acc_per_class_after
     }
 
-def pruning(model, train_loader, parameters, baseline_acc, use_max_rounds=True, lr=0.01, mode="full", min_width=5):
+def pruning(model, train_loader, parameters, baseline_acc, use_max_rounds=True, lr=0.01, mode="full", min_width=5, fresh_loader=None):
     max_rounds, prune_frac, prune_con_frac, regrow_frac, retrain_epochs, max_acc_drop = parameters
 
     current_model = copy.deepcopy(model)
@@ -98,7 +99,11 @@ def pruning(model, train_loader, parameters, baseline_acc, use_max_rounds=True, 
         new_model = copy.deepcopy(current_model)
         prune_counts = None
         regrow_counts = None
-
+        if fresh_loader is not None:
+            mixed = ConcatDataset([train_loader.dataset, fresh_loader.dataset])
+            loader_to_use = DataLoader(mixed, batch_size=train_loader.batch_size, shuffle=True)
+        else:
+            loader_to_use = train_loader    
         # 2. Pruning neurons
         if mode in ["full", "neuron_only", "prune_only"]:
             prune_counts = new_model.prune_hidden_neurons(
@@ -115,7 +120,7 @@ def pruning(model, train_loader, parameters, baseline_acc, use_max_rounds=True, 
             new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
             print("Retraining after pruning...")
             val_acc = new_model.train_model(
-                train_loader,
+                loader_to_use,
                 epochs=retrain_epochs,
                 lr=lr,
                 val_interval=1,
@@ -135,7 +140,7 @@ def pruning(model, train_loader, parameters, baseline_acc, use_max_rounds=True, 
                 new_model.optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
                 print("Retraining after regrowth...")
                 val_acc = new_model.train_model(
-                    train_loader,
+                    loader_to_use,
                     epochs=2,
                     lr=lr,
                     val_interval=1,
@@ -242,70 +247,6 @@ def _build_neuron_adjacency(layer_data, layer_mapping, weight_threshold=1e-10):
     return adj
 
 
-def _merge_components_by_similarity(component_labels, n_components, n_clusters,
-                                     layer_mapping, layer_data, all_neuron_activations):
-    """
-    Merge connected components down to n_clusters using greedy cosine similarity.
-
-    Computes a per-component centroid as the mean activation across the dataset,
-    then iteratively merges the most similar pair until n_clusters remain.
-
-    Returns:
-        defaultdict(list) cluster_map in the same format as cluster_neurons output
-    """
-    # Map each component to its neuron indices
-    component_to_neurons = defaultdict(list)
-    for neuron_idx, comp_id in enumerate(component_labels):
-        component_to_neurons[int(comp_id)].append(neuron_idx)
-
-    acts_np = all_neuron_activations.numpy()  # [N_samples, total_neurons]
-
-    # Centroid: mean activation of the component across the dataset [N_samples]
-    centroids = {
-        comp_id: acts_np[:, indices].mean(axis=1)
-        for comp_id, indices in component_to_neurons.items()
-    }
-
-    # Greedy merge: {super_id: [comp_ids]}
-    super_components = {cid: [cid] for cid in component_to_neurons}
-    super_centroids  = {cid: centroids[cid].copy() for cid in centroids}
-    super_sizes      = {cid: len(component_to_neurons[cid]) for cid in component_to_neurons}
-
-    current_n = n_components
-    while current_n > n_clusters:
-        ids = list(super_centroids.keys())
-        best_sim, best_a, best_b = -np.inf, None, None
-
-        for a in range(len(ids)):
-            for b in range(a + 1, len(ids)):
-                id_a, id_b = ids[a], ids[b]
-                va, vb = super_centroids[id_a], super_centroids[id_b]
-                norm_a, norm_b = np.linalg.norm(va), np.linalg.norm(vb)
-                if norm_a < 1e-12 or norm_b < 1e-12:
-                    sim = 0.0
-                else:
-                    sim = np.dot(va, vb) / (norm_a * norm_b)
-                if sim > best_sim:
-                    best_sim, best_a, best_b = sim, id_a, id_b
-
-        # Merge best_b into best_a with neuron-count-weighted centroid
-        n_a, n_b = super_sizes[best_a], super_sizes[best_b]
-        super_centroids[best_a] = (
-            super_centroids[best_a] * n_a + super_centroids[best_b] * n_b
-        ) / (n_a + n_b)
-        super_sizes[best_a] = n_a + n_b
-        super_components[best_a].extend(super_components.pop(best_b))
-        del super_centroids[best_b]
-        del super_sizes[best_b]
-        current_n -= 1
-
-    # Build cluster_map (1-indexed)
-    result = defaultdict(list)
-    for cluster_id, (_, comp_ids) in enumerate(super_components.items(), start=1):
-        for comp_id in comp_ids:
-            result[cluster_id].extend(component_to_neurons[comp_id])
-    return result
-
 def cluster_neurons(layer_data, n_clusters, mode='full', nmf_subsample=15000):
     """
     Cluster neurons in a model using NMF on their activation patterns.
@@ -375,31 +316,9 @@ def cluster_neurons(layer_data, n_clusters, mode='full', nmf_subsample=15000):
 
     return cluster_map, layer_mapping, all_neuron_activations
 
-def cluster_neurons_fabio(layer_data, n_clusters, mode='full', nmf_subsample=15000,
-                    enforce_connectivity=False, weight_threshold=1e-10):
-    """
-    Cluster neurons in a model using NMF on their activation patterns.
-
-    Args:
-        layer_data:            dict from model.get_layer_data(), keys like 'layer_0', 'layer_1', ...
-                               each value has {'weights': tensor [out, in], 'post_activation': tensor [N, out]}
-        n_clusters:            number of clusters
-        mode:                  'full'      — cluster all neurons together across the whole model
-                               'per_layer' — cluster each layer independently
-        nmf_subsample:         max samples used to fit NMF (subsampled randomly if exceeded)
-        enforce_connectivity:  if True (mode='full' only), ensures no cluster has direct weight
-                               connections to another cluster. Uses connected components of the weight
-                               graph as hard boundaries. Falls back to standard NMF if the network
-                               is fully connected (1 component). Has no effect in mode='per_layer'.
-        weight_threshold:      minimum abs(weight) to treat as an active connection (default 1e-10).
-
-    Returns:
-        cluster_map:           {cluster_id: [global_neuron_indices]}
-        layer_mapping:         [(layer_name, start_idx, end_idx), ...]
-        all_neuron_activations: tensor [N_samples, total_neurons]
-    """
-    import warnings
+def cluster_neurons_fabio(layer_data, min_clusters=2, max_clusters=10, nmf_subsample=15000, weight_threshold=1e-10):
     from sklearn.decomposition import NMF
+    from scipy.sparse.csgraph import connected_components
 
     hidden_layers = [k for k in layer_data.keys() if 'layer_' in k]
 
@@ -414,77 +333,59 @@ def cluster_neurons_fabio(layer_data, n_clusters, mode='full', nmf_subsample=150
         [layer_data[ln]['post_activation'] for ln in hidden_layers], dim=1
     )
 
-    cluster_map = defaultdict(list)
+    adj = _build_neuron_adjacency(layer_data, layer_mapping, weight_threshold)
+    n_comp, labels = connected_components(adj, directed=False, return_labels=True)
 
-    def _fit_nmf(activations_np, k):
-        if activations_np.shape[0] > nmf_subsample:
-            rng = np.random.default_rng(42)
-            idx = rng.choice(activations_np.shape[0], size=nmf_subsample, replace=False)
-            fit_data = activations_np[idx]
-        else:
-            fit_data = activations_np
-        nmf = NMF(n_components=k, random_state=42, max_iter=500)
-        nmf.fit(fit_data)
-        return nmf.components_  # [k, n_neurons]
+    component_to_neurons = defaultdict(list)
+    for neuron_idx, comp_id in enumerate(labels):
+        component_to_neurons[int(comp_id)].append(neuron_idx)
 
-    if enforce_connectivity and mode == 'per_layer':
-        warnings.warn(
-            "enforce_connectivity=True has no effect in mode='per_layer' "
-            "(constraint is only meaningful for multi-layer clustering). "
-            "Proceeding with standard per-layer NMF."
+    acts_np = all_neuron_activations.numpy()
+    comp_acts = np.stack(
+        [acts_np[:, component_to_neurons[c]].mean(axis=1) for c in range(n_comp)],
+        axis=1
+    )  # [N_samples, n_comp]
+
+    if comp_acts.shape[0] > nmf_subsample:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(comp_acts.shape[0], size=nmf_subsample, replace=False)
+        fit_data = comp_acts[idx]
+    else:
+        fit_data = comp_acts
+
+    n_nmf = min(max_clusters, n_comp, fit_data.shape[0])
+    nmf = NMF(n_components=n_nmf, random_state=42, max_iter=500)
+    W = nmf.fit_transform(fit_data)  # [N_samples_sub, n_nmf]
+    H = nmf.components_              # [n_nmf, n_comp]
+
+    contribs = np.array([
+        np.linalg.norm(W[:, k]) * np.linalg.norm(H[k, :])
+        for k in range(n_nmf)
+    ])
+    fracs = contribs / (contribs.sum() + 1e-12)
+    threshold = 1.0 / (2 * n_nmf)
+    surviving = np.where(fracs > threshold)[0]
+    k_found = len(surviving)
+
+    if k_found < min_clusters:
+        raise ValueError(
+            f"pruning did not isolate enough components, found {k_found}, "
+            f"expected at least {min_clusters}. Prune more aggressively."
+        )
+    if k_found > max_clusters:
+        raise ValueError(
+            "found more clusters than max_clusters, raise max_clusters or prune more aggressively"
         )
 
-    if mode == 'full':
-        if enforce_connectivity:
-            from scipy.sparse.csgraph import connected_components
+    H_surviving = H[surviving, :]          # [k_found, n_comp]
+    comp_assignments = H_surviving.argmax(axis=0)  # [n_comp] -> index into surviving
 
-            adj = _build_neuron_adjacency(layer_data, layer_mapping, weight_threshold)
-            n_comp, labels = connected_components(adj, directed=False, return_labels=True)
+    cluster_map = defaultdict(list)
+    for comp_id in range(n_comp):
+        cluster_id = int(comp_assignments[comp_id]) + 1  # 1-indexed
+        cluster_map[cluster_id].extend(component_to_neurons[comp_id])
 
-            if n_comp == 1:
-                warnings.warn(
-                    "enforce_connectivity: Network is fully connected (1 component). "
-                    "No isolated clusters exist. Falling back to standard NMF."
-                )
-                H = _fit_nmf(all_neuron_activations.numpy(), n_clusters)
-                for neuron_idx, cluster_id in enumerate(H.argmax(axis=0)):
-                    cluster_map[int(cluster_id) + 1].append(neuron_idx)
-            elif n_comp <= n_clusters:
-                if n_comp < n_clusters:
-                    warnings.warn(
-                        f"enforce_connectivity: Only {n_comp} disconnected components exist "
-                        f"(requested {n_clusters}). Using {n_comp} clusters."
-                    )
-                for neuron_idx, comp_id in enumerate(labels):
-                    cluster_map[int(comp_id) + 1].append(neuron_idx)
-            else:
-                # n_comp > n_clusters: merge by activation similarity
-                cluster_map = _merge_components_by_similarity(
-                    labels, n_comp, n_clusters,
-                    layer_mapping, layer_data, all_neuron_activations,
-                )
-        else:
-            H = _fit_nmf(all_neuron_activations.numpy(), n_clusters)
-            for neuron_idx, cluster_id in enumerate(H.argmax(axis=0)):
-                cluster_map[int(cluster_id) + 1].append(neuron_idx)
-
-    elif mode == 'per_layer':
-        cluster_offset = 0
-        for layer_name, start, end in layer_mapping:
-            layer_acts = layer_data[layer_name]['post_activation'].numpy()
-            k = min(n_clusters, layer_acts.shape[1])
-            H = _fit_nmf(layer_acts, k)
-            for local_idx, local_cluster in enumerate(H.argmax(axis=0)):
-                global_id = cluster_offset + int(local_cluster) + 1
-                cluster_map[global_id].append(start + local_idx)
-            cluster_offset += k
-
-    else:
-        raise ValueError(f"Unknown mode {mode!r}. Use 'full' or 'per_layer'.")
-
-    total_neurons = sum(end - start for _, start, end in layer_mapping)
-    print(f"Clustered {total_neurons} neurons into {len(cluster_map)} clusters (mode='{mode}')")
-
+    print(f"Found {k_found} clusters from {n_comp} structural components.")
     return cluster_map, layer_mapping, all_neuron_activations
 
 

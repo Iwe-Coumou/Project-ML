@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import activation_maximization as am
 
 
 def plot_first_layer_weights(model, layer_data=None, sort_by='weight_norm', top_n=None, n_cols=8):
@@ -156,15 +157,18 @@ def plot_loss(metrics):
     plt.grid(True)
     plt.show()
 
-def plot_cluster_prototypes_and_diff_all(all_prototypes):
+def plot_cluster_prototypes_and_diff_all(all_prototypes, model, cluster_map, layer_mapping):
     """
     Plot prototypes and difference maps for all clusters.
 
     Args:
         all_prototypes: dict {cluster_id: {'prototype': 28x28 array, 'diff_map': 28x28 array}}
+        model:          NeuralNetwork instance
+        cluster_map:    {cluster_id: [global_neuron_indices]}
+        layer_mapping:  [(layer_name, start_idx, end_idx), ...]
     """
     n_clusters = len(all_prototypes)
-    fig, axes = plt.subplots(2, n_clusters, figsize=(n_clusters*2, 4))
+    fig, axes = plt.subplots(3, n_clusters, figsize=(n_clusters*2, 6))
 
     for i, cluster_id in enumerate(sorted(all_prototypes.keys())):
         proto = all_prototypes[cluster_id]['prototype']
@@ -187,7 +191,16 @@ def plot_cluster_prototypes_and_diff_all(all_prototypes):
         # Column title = cluster ID
         ax_top.set_title(f'Cluster {cluster_id}', fontsize=10)
 
-    plt.suptitle('All Clusters - Prototypes & Difference Maps', fontsize=12)
+    # Third row = activation maximization
+    for i, cluster_id in enumerate(sorted(all_prototypes.keys())):
+        act_max = am.visualize_cluster(model, cluster_map, layer_mapping, cluster_id, show=False)
+        ax_act = axes[2, i] if n_clusters > 1 else axes[2]
+        ax_act.imshow(act_max, cmap='gray')
+        ax_act.axis('off')
+        if i == 0:
+            ax_act.set_ylabel('Activation Max', fontsize=10)
+
+    plt.suptitle('All Clusters - Prototypes, Difference Maps & Activation Maximization', fontsize=12)
     plt.tight_layout()
     plt.show()
 
