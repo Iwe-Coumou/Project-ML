@@ -3,7 +3,7 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, random_split
 
 # model parameters
-HIDDEN_LAYERS = [64, 64, 64, 32]
+HIDDEN_LAYERS = [128, 128, 128, 64]
 TRAIN_VAL_SPLIT = 0.8
 TRAIN_FRESH_SPLIT = 0.1
 NUM_WORKERS = 4
@@ -14,11 +14,13 @@ MAX_CLUSTERS = 10
 
 # pruning loop
 N_FINAL_RETRAIN_EPOCHS   = 50
-CROSS_CLUSTER_PRUNE_FRAC = 0.3
+CROSS_CLUSTER_PRUNE_FRAC = 0.6
 TOPOLOGY_THRESHOLD       = 0.15
-PHASE2_MIN_NEURONS       = 50
-PHASE2_MIN_CONNECTIONS   = 200
+PHASE2_MIN_NEURONS       = 100
+PHASE2_MIN_CONNECTIONS   = 2000
 ERROR_THRESHOLD_FRAC     = 1.5
+REGROW_FRAC              = 0.1     # fraction of pruned neurons to regrow; 0 = disabled
+N_SPAWN                  = 2     # neurons spawned per underperforming cluster per round
 
 
 def get_device():

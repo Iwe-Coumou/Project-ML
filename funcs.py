@@ -202,6 +202,32 @@ def remove_unreachable_neurons(model):
         counts[f'layer_{pp}'] = n_invalid
         total_removed += n_invalid
 
+    # --- Remove layer_0 neurons with no outgoing connections to layer_1 ---
+    # Pixel weights are never pruned so in_dead is always False for layer_0;
+    # only check the outgoing side: columns of W_layer1 that are entirely zero.
+    if n_lin >= 2:
+        l0_idx = linear_indices[0]
+        l1_idx = linear_indices[1]
+        layer_0 = model.layer_stack[l0_idx]
+        layer_1 = model.layer_stack[l1_idx]
+        W_l1 = layer_1.weight.data          # [l1_out, l0_out]
+        keep_l0 = W_l1.abs().sum(dim=0) > 0  # [l0_out] — True if any l1 neuron listens
+        n_dead_l0 = int((~keep_l0).sum().item())
+        if n_dead_l0 > 0 and keep_l0.any():  # always keep at least 1 neuron
+            keep_idx = keep_l0.nonzero(as_tuple=True)[0]
+            layer_0.weight.data  = layer_0.weight.data[keep_idx, :]
+            layer_0.bias.data    = layer_0.bias.data[keep_idx]
+            layer_0.out_features = layer_0.weight.shape[0]
+            layer_1.weight.data  = layer_1.weight.data[:, keep_idx]
+            layer_1.in_features  = layer_1.weight.shape[1]
+            if hasattr(model, 'connection_masks'):
+                if l0_idx in model.connection_masks:
+                    model.connection_masks[l0_idx] = model.connection_masks[l0_idx][keep_idx, :]
+                if l1_idx in model.connection_masks:
+                    model.connection_masks[l1_idx] = model.connection_masks[l1_idx][:, keep_idx]
+            counts['layer_0'] = n_dead_l0
+            total_removed += n_dead_l0
+
     if total_removed:
         counts_str = ', '.join(f'{ln}: {n}' for ln, n in counts.items())
         print(f"  Removed {total_removed} unreachable neurons ({counts_str})")
@@ -422,7 +448,7 @@ def _prune_connections_native(model, prune_frac, layer_data=None):
         if layer_data is not None:
             src_key = f'layer_{j - 1}'
             if src_key in layer_data:
-                mean_act = layer_data[src_key]['post_activation'].abs().mean(dim=0)  # [in]
+                mean_act = layer_data[src_key]['post_activation'].abs().mean(dim=0).to(W.device)  # [in]
                 if mean_act.shape[0] == W.shape[1]:  # activations match current weight shape
                     importance = W.abs() * mean_act.unsqueeze(0)
                 else:  # activations are stale (neurons were pruned after layer_data was collected)
@@ -655,9 +681,9 @@ def _measure_cluster_ablation(model, cluster_map, layer_mapping, val_loader, dev
 
 
 def error_driven_regrowth(model, cluster_map, layer_mapping, val_loader,
-                          threshold_frac, device):
+                          threshold_frac, device, n_spawn=1):
     """
-    Add one neuron to each underperforming cluster (drop < mean_drop / threshold_frac).
+    Add n_spawn neurons to each underperforming cluster (drop < mean_drop / threshold_frac).
 
     Weight initialisation uses an Exponential distribution scaled by mean network weight,
     then thresholded (weights below epsilon*max zeroed). Sparsity is emergent, not fixed.
@@ -671,6 +697,9 @@ def error_driven_regrowth(model, cluster_map, layer_mapping, val_loader,
     mean_drop = float(np.mean(list(drops.values()))) if drops else 0.0
     threshold = mean_drop / threshold_frac
 
+    print(f"  Ablation drops: { {cid: round(d, 4) for cid, d in drops.items()} }")
+    print(f"  Underperforming threshold: {threshold:.4f}  (mean_drop={mean_drop:.4f}, threshold_frac={threshold_frac})")
+
     all_w = torch.cat([
         model.layer_stack[li].weight.data.abs().view(-1) for li in linear_indices
     ])
@@ -683,10 +712,11 @@ def error_driven_regrowth(model, cluster_map, layer_mapping, val_loader,
 
     for cluster_id, drop in drops.items():
         if drop >= threshold:
+            print(f"  Cluster {cluster_id}: drop={drop:.4f} >= threshold — OK, no regrowth")
             continue
 
         neurons = cluster_map[cluster_id]
-        print(f"  Cluster {cluster_id}: drop={drop:.4f} < {threshold:.4f} → adding neuron")
+        print(f"  Cluster {cluster_id}: drop={drop:.4f} < {threshold:.4f} — underperforming, spawning {n_spawn} neuron(s)")
 
         # Find primitive layer with most of this cluster's neurons
         layer_counts = defaultdict(list)
@@ -697,7 +727,7 @@ def error_driven_regrowth(model, cluster_map, layer_mapping, val_loader,
                     break
         if not layer_counts:
             continue
-        target_lname    = max(layer_counts, key=lambda ln: len(layer_counts[ln]))
+        target_lname     = max(layer_counts, key=lambda ln: len(layer_counts[ln]))
         target_layer_num = int(target_lname.split('_')[1])
         layer_idx        = linear_indices[target_layer_num]
         next_layer_idx   = linear_indices[target_layer_num + 1]
@@ -707,7 +737,7 @@ def error_driven_regrowth(model, cluster_map, layer_mapping, val_loader,
         in_features      = layer.weight.size(1)
         out_features_next = next_layer.weight.size(0)
 
-        def _expo_sparse(allowed_indices, size, rng_key=None):
+        def _expo_sparse(allowed_indices, size):
             """Sample Exponential weights for allowed indices, threshold the rest to 0."""
             vec = torch.zeros(size, device=dev)
             if not allowed_indices:
@@ -723,54 +753,63 @@ def error_driven_regrowth(model, cluster_map, layer_mapping, val_loader,
                     vec[src_i] = raw[k_i]
             return vec
 
-        # Incoming: from same-cluster neurons in the previous primitive layer
+        # Same-cluster neighbours — computed once; neurons added this round are not in ntc
         prev_lname = f'layer_{target_layer_num - 1}'
         same_in    = [
             local_i for (ln, local_i), cid in ntc.items()
             if ln == prev_lname and cid == cluster_id
         ] if target_layer_num > 0 else []
         allowed_in = same_in if same_in else list(range(in_features))
-        new_row = _expo_sparse(allowed_in, in_features)
 
-        layer.weight.data  = torch.cat([layer.weight.data, new_row.unsqueeze(0)], dim=0)
-        layer.bias.data    = torch.cat([layer.bias.data, torch.zeros(1, device=dev)], dim=0)
-        layer.out_features = layer.weight.shape[0]
-
-        # Outgoing: to same-cluster neurons in the next primitive layer
         next_lname = f'layer_{target_layer_num + 1}'
         same_out   = [
             local_i for (ln, local_i), cid in ntc.items()
             if ln == next_lname and cid == cluster_id
         ]
         allowed_out = same_out if same_out else list(range(out_features_next))
-        new_col = _expo_sparse(allowed_out, out_features_next)
 
-        next_layer.weight.data = torch.cat([next_layer.weight.data, new_col.unsqueeze(1)], dim=1)
-        next_layer.in_features = next_layer.weight.shape[1]
+        for spawn_i in range(n_spawn):
+            new_row = _expo_sparse(allowed_in, in_features)
+            new_col = _expo_sparse(allowed_out, out_features_next)
 
-        # Update masks
-        if not hasattr(model, 'connection_masks'):
-            model.connection_masks = {}
-        if layer_idx in model.connection_masks:
-            model.connection_masks[layer_idx] = torch.cat(
-                [model.connection_masks[layer_idx], (new_row != 0).float().unsqueeze(0)], dim=0
-            )
-        if next_layer_idx in model.connection_masks:
-            model.connection_masks[next_layer_idx] = torch.cat(
-                [model.connection_masks[next_layer_idx], (new_col != 0).float().unsqueeze(1)], dim=1
-            )
+            n_in     = int((new_row != 0).sum().item())
+            n_out    = int((new_col != 0).sum().item())
+            mean_in  = new_row[new_row != 0].abs().mean().item() if n_in  > 0 else 0.0
+            mean_out = new_col[new_col != 0].abs().mean().item() if n_out > 0 else 0.0
+            print(f"    [{spawn_i + 1}/{n_spawn}] spawned in {target_lname}: "
+                  f"{n_in} in-connections (mean |w|={mean_in:.4f}), "
+                  f"{n_out} out-connections (mean |w|={mean_out:.4f})")
 
-        # Register new neuron in cluster_map.
-        # Use end2 + layer_added[target_lname] so that if multiple clusters grow in the same
-        # layer this round each gets the correct unique global index.
-        for lname2, start2, end2 in layer_mapping:
-            if lname2 == target_lname:
-                new_global_idx = end2 + layer_added[target_lname]
-                cluster_map[cluster_id].append(new_global_idx)
-                layer_added[target_lname] += 1
-                break
+            layer.weight.data  = torch.cat([layer.weight.data, new_row.unsqueeze(0)], dim=0)
+            layer.bias.data    = torch.cat([layer.bias.data, torch.zeros(1, device=dev)], dim=0)
+            layer.out_features = layer.weight.shape[0]
 
-        n_added += 1
+            next_layer.weight.data = torch.cat([next_layer.weight.data, new_col.unsqueeze(1)], dim=1)
+            next_layer.in_features = next_layer.weight.shape[1]
+
+            # Update masks
+            if not hasattr(model, 'connection_masks'):
+                model.connection_masks = {}
+            if layer_idx in model.connection_masks:
+                model.connection_masks[layer_idx] = torch.cat(
+                    [model.connection_masks[layer_idx], (new_row != 0).float().unsqueeze(0)], dim=0
+                )
+            if next_layer_idx in model.connection_masks:
+                model.connection_masks[next_layer_idx] = torch.cat(
+                    [model.connection_masks[next_layer_idx], (new_col != 0).float().unsqueeze(1)], dim=1
+                )
+
+            # Register new neuron in cluster_map.
+            # Use end2 + layer_added[target_lname] so that if multiple clusters grow in the same
+            # layer this round each gets the correct unique global index.
+            for lname2, start2, end2 in layer_mapping:
+                if lname2 == target_lname:
+                    new_global_idx = end2 + layer_added[target_lname]
+                    cluster_map[cluster_id].append(new_global_idx)
+                    layer_added[target_lname] += 1
+                    break
+
+            n_added += 1
 
     return n_added
 
@@ -837,7 +876,7 @@ def pruning(model, train_loader, val_loader, parameters, baseline_acc,
             use_max_rounds=True, lr=0.01, mode="full", min_width=5, fresh_loader=None,
             max_clusters=10, cross_cluster_prune_frac=0.3, topology_threshold=0.15,
             error_threshold_frac=1.5, n_final_retrain_epochs=15,
-            phase2_min_neurons=150, phase2_min_connections=5000):
+            phase2_min_neurons=150, phase2_min_connections=5000, n_spawn=1):
     max_rounds, prune_frac, prune_con_frac, regrow_frac, retrain_epochs, max_acc_drop = parameters
 
     current_model = copy.deepcopy(model)
@@ -967,7 +1006,7 @@ def pruning(model, train_loader, val_loader, parameters, baseline_acc,
         if regrow_frac > 0 and cluster_found and current_cluster_map is not None:
             n_added = error_driven_regrowth(
                 current_model, current_cluster_map, current_layer_mapping,
-                val_loader, error_threshold_frac, current_model.device
+                val_loader, error_threshold_frac, current_model.device, n_spawn=n_spawn
             )
             if n_added > 0:
                 print(f"  Added {n_added} neurons via error-driven regrowth. Brief retraining...")
@@ -1034,7 +1073,7 @@ def compute_regrow_from_width(model, regrow_frac):
 
     return regrow_counts
 
-def _build_neuron_adjacency(layer_data, layer_mapping, weight_threshold=1e-10):
+def _build_neuron_adjacency(layer_data, layer_mapping, weight_threshold=0.01):
     """
     Build a sparse undirected adjacency matrix for the neuron weight graph.
 
