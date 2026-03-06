@@ -15,7 +15,7 @@ class NeuralNetwork(nn.Module):
         in_size = input_size
         for h in hidden_sizes:
             layers.append(nn.Linear(in_size, h))
-            layers.append(nn.ReLU())
+            layers.append(nn.ELU())
             in_size = h
         layers.append(nn.Linear(in_size, output_size))
         
@@ -69,13 +69,16 @@ class NeuralNetwork(nn.Module):
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                self.optimizer.step()
 
-                # --- Enforce permanent connection pruning ---
-                if hasattr(self, "connection_masks") and self.connection_masks is not None:
+                # Zero gradients for pruned connections before optimizer step so
+                # Adam never accumulates momentum for them � they stay permanently zero.
+                if hasattr(self, 'connection_masks') and self.connection_masks:
                     for layer_idx, mask in self.connection_masks.items():
-                        layer = self.layer_stack[layer_idx]
-                        layer.weight.data *= mask
+                        p = self.layer_stack[layer_idx].weight
+                        if p.grad is not None:
+                            p.grad.data *= mask
+
+                self.optimizer.step()
 
             # Validation every val_interval epochs
             if val_loader and (epoch + 1) % val_interval == 0:
@@ -186,8 +189,8 @@ class NeuralNetwork(nn.Module):
                         pre_act = out.detach().cpu().clone()
                         if layers_to_record is None or logical_layer in layers_to_record:
                             post_act = out.detach().cpu().clone()
-                            # check for ReLU
-                            if i + 1 < len(self.layer_stack) and isinstance(self.layer_stack[i + 1], nn.ReLU):
+                            # check for activation function (any non-Linear, non-Flatten layer)
+                            if i + 1 < len(self.layer_stack) and not isinstance(self.layer_stack[i + 1], (nn.Linear, nn.Flatten)):
                                 out = self.layer_stack[i + 1](out)
                                 post_act = out.detach().cpu().clone()
                                 i += 1
@@ -235,14 +238,16 @@ class NeuralNetwork(nn.Module):
     
     def compute_neuron_importance(self, layer_data=None, X=None, alpha=0.7, type='combined'):
         """
-        Computes importance scores for each neuron in hidden layers:
-        I(v) = alpha * activation_variance + (1 - alpha) * sum_abs_weights
+        Computes importance scores for each neuron in hidden layers.
 
         Args:
             layer_data: Precomputed dict from get_layer_data (optional).
             X: Input tensor or DataLoader, used only if layer_data is None.
-            alpha: Weight for activation variance in combined score.
-            type: 'combined', 'var', or 'weight'.
+            alpha: Weight for activation variance in 'combined' score.
+            type: 'combined', 'var', 'weight', or 'downstream_blend'.
+                  'downstream_blend' — blends downstream influence with variance:
+                      I = beta * (mean_act × downstream_col_L1) + (1 - beta) * variance
+                  where beta=0.7 by default. beta=1 → pure downstream, beta=0 → pure variance.
 
         Returns:
             dict: { 'layer_0': tensor of scores, ... }
@@ -253,14 +258,16 @@ class NeuralNetwork(nn.Module):
             layer_data = self.get_layer_data(X)
 
         importance_scores = {}
+        # Ordered list of linear-layer positions in layer_stack (needed for downstream_blend)
+        lin_idxs = [i for i, l in enumerate(self.layer_stack) if isinstance(l, nn.Linear)]
 
         for layer_name, data in layer_data.items():
             weights = data['weights']       # [out_features, in_features]
             bias = data['bias']             # [out_features]
-            post_act = data['post_activation']  # [N_samples, out_features]
+            pre_act = data['pre_activation']  # [N_samples, out_features]
 
-            # Activation-based importance
-            I_act = post_act.var(dim=0)
+            # Pre-activation variance: true sensitivity regardless of activation function
+            I_act = pre_act.var(dim=0)
             if type == 'var':
                 importance_scores[layer_name] = I_act
                 continue
@@ -271,7 +278,22 @@ class NeuralNetwork(nn.Module):
                 importance_scores[layer_name] = I_weight
                 continue
 
-            # Combined importance
+            if type == 'downstream_blend':
+                # beta controls the blend between downstream influence and activation variance:
+                #   beta=1.0 → pure downstream (next layer's attention × this neuron's signal)
+                #   beta=0.0 → pure variance   (classic sensitivity criterion)
+                beta = 0.7
+                k = int(layer_name.split('_')[1])
+                next_layer = self.layer_stack[lin_idxs[k + 1]]   # always exists for non-output layers
+                W_next = next_layer.weight.detach().to(pre_act.device)  # match layer_data device
+                downstream_attention = W_next.abs().sum(dim=0)    # how much next layer cares per neuron
+                mean_act = pre_act.abs().mean(dim=0)              # mean signal this neuron produces
+                I_downstream = mean_act * downstream_attention
+                I = beta * I_downstream + (1 - beta) * I_act
+                importance_scores[layer_name] = I
+                continue
+
+            # Combined importance (default)
             I = alpha * I_act + (1 - alpha) * I_weight
             importance_scores[layer_name] = I
 
@@ -279,7 +301,11 @@ class NeuralNetwork(nn.Module):
 
     def prune_hidden_neurons(self, importance_scores, prune_rate=0.05):
         """
-        Prune hidden neurons based on importance scores.
+        Prune hidden neurons based on importance scores using a global budget.
+
+        The bottom (prune_rate * total_neurons) neurons across ALL layers are removed
+        together, so weak layers shrink more and strong layers shrink less — rather than
+        every layer losing the same fixed fraction.
 
         Returns:
             dict: {layer_idx: n_pruned}
@@ -287,40 +313,68 @@ class NeuralNetwork(nn.Module):
         linear_indices = [i for i, l in enumerate(self.layer_stack) if isinstance(l, nn.Linear)]
         hidden_linear_indices = linear_indices[:-1]  # exclude output layer
 
+        # --- Global ranking: collect all scores with their layer membership ---
+        layer_score_map = {}  # position_idx -> scores tensor
+        for idx in range(len(hidden_linear_indices)):
+            lname = f'layer_{idx}'
+            if lname in importance_scores:
+                layer_score_map[idx] = importance_scores[lname]
+
+        if not layer_score_map:
+            return {}
+
+        all_scores = torch.cat(list(layer_score_map.values()))
+        n_total = all_scores.numel()
+        n_remove = int(prune_rate * n_total)
+        if n_remove == 0:
+            return {}
+
+        # Find global threshold: the n_remove-th smallest score
+        # Use topk to get exact bottom-n_remove indices mapped back to layers
+        _, bottom_global = torch.topk(all_scores, n_remove, largest=False)
+        remove_global = set(bottom_global.tolist())
+
+        # Map global indices back to per-layer keep tensors
+        keep_idxs = {}
+        offset = 0
+        for idx, scores in layer_score_map.items():
+            n = scores.numel()
+            keep = [i for i in range(n) if (i + offset) not in remove_global]
+            if len(keep) == 0:
+                keep = [int(scores.argmax())]  # always keep at least the best neuron
+            keep_idxs[idx] = torch.tensor(keep, dtype=torch.long)
+            offset += n
+
+        # --- Apply removals sequentially ---
         prune_counts = {}
-
-        for idx, layer_idx in enumerate(hidden_linear_indices):
+        for idx in sorted(keep_idxs.keys()):
+            layer_idx = hidden_linear_indices[idx]
             layer = self.layer_stack[layer_idx]
-            scores = importance_scores[f'layer_{idx}']
+            keep = keep_idxs[idx]
 
-            n_neurons = scores.numel()
-            n_remove = int(prune_rate * n_neurons)
-            if n_remove == 0:
-                continue
+            original_size = layer.weight.shape[0]
+            if keep.numel() == original_size:
+                continue  # nothing to remove from this layer
 
-            keep_idx = scores.argsort(descending=True)[:-n_remove]
+            layer.weight.data = layer.weight.data[keep, :]
+            layer.bias.data = layer.bias.data[keep]
+            layer.out_features = layer.weight.shape[0]
 
-            # Prune current layer
-            layer.weight.data = layer.weight.data[keep_idx, :]
-            layer.bias.data = layer.bias.data[keep_idx]
-
-            # Adjust next layer input weights
             next_layer = self.layer_stack[linear_indices[idx + 1]]
-            next_layer.weight.data = next_layer.weight.data[:, keep_idx]
+            next_layer.weight.data = next_layer.weight.data[:, keep]
+            next_layer.in_features = next_layer.weight.shape[1]
 
-            # Record how many neurons were pruned
-            prune_counts[layer_idx] = n_remove
+            prune_counts[layer_idx] = original_size - keep.numel()
 
             if hasattr(self, 'connection_masks') and layer_idx in self.connection_masks:
-                self.connection_masks[layer_idx] = self.connection_masks[layer_idx][keep_idx, :]
+                self.connection_masks[layer_idx] = self.connection_masks[layer_idx][keep, :]
 
-            # After pruning next layer's input weights
             next_layer_idx = linear_indices[idx + 1]
             if hasattr(self, 'connection_masks') and next_layer_idx in self.connection_masks:
-                self.connection_masks[next_layer_idx] = self.connection_masks[next_layer_idx][:, keep_idx]
-        
+                self.connection_masks[next_layer_idx] = self.connection_masks[next_layer_idx][:, keep]
+
         if hasattr(self, "connection_masks") and self.connection_masks is not None:
-            for layer_idx, mask in self.connection_masks.items() :
+            for layer_idx, mask in self.connection_masks.items():
                 layer = self.layer_stack[layer_idx]
                 assert mask.shape == layer.weight.shape, \
                     f"Mask mismatch at layer {layer_idx}: mask {mask.shape} vs weight {layer.weight.shape}"
@@ -328,109 +382,54 @@ class NeuralNetwork(nn.Module):
         return prune_counts
 
     
-    def regrow_hidden_neurons(self, regrow_counts, regrow_std=0.01):
+    def regrow_hidden_neurons(self, regrow_counts, n_connections=20, weight_scale=1e-3):
         """
-        Regrow neurons in hidden layers.
+        Add new neurons to hidden layers with a small number of sparse random connections.
 
         Args:
-            regrow_counts: dict {layer_idx: n_regrow}
-            regrow_std: std for initializing new weights/bias
+            regrow_counts:  {layer_stack_idx: n_neurons_to_add}
+            n_connections:  how many random active connections each new neuron gets
+            weight_scale:   std for initializing the active connections
         """
-        linear_indices = [i for i, l in enumerate(self.layer_stack)
-                        if isinstance(l, nn.Linear)]
-        hidden_linear_indices = linear_indices[:-1] if len(linear_indices) > 1 else []
-
-        for idx, layer_idx in enumerate(hidden_linear_indices):
-
-            if layer_idx not in regrow_counts:
-                continue
-
-            n_regrow = regrow_counts[layer_idx]
-            if n_regrow <= 0:
-                continue
-
-            layer = self.layer_stack[layer_idx]
-            next_layer = self.layer_stack[linear_indices[idx + 1]]
-
-            in_features = layer.weight.size(1)
-            out_features_next = next_layer.weight.size(0)
-
-            device = layer.weight.device
-
-            # --- Add new neurons to current layer ---
-            new_weights = torch.randn(n_regrow, in_features, device=device) * regrow_std
-            new_bias = torch.randn(n_regrow, device=device) * regrow_std
-
-            layer.weight.data = torch.cat([layer.weight.data, new_weights], dim=0)
-            layer.bias.data = torch.cat([layer.bias.data, new_bias], dim=0)
-
-            # --- Add corresponding input columns in next layer ---
-            new_input_weights = torch.randn(out_features_next, n_regrow, device=device) * regrow_std
-            next_layer.weight.data = torch.cat([next_layer.weight.data, new_input_weights], dim=1)
-
-        if not hasattr(self, "connection_masks"):
-            return
-        for layer_idx, mask in self.connection_masks.items():
-            layer = self.layer_stack[layer_idx]
-
-            n_new_rows = layer.weight.shape[0] - mask.shape[0]
-            n_new_cols = layer.weight.shape[1] - mask.shape[1]
-
-            if n_new_rows > 0:
-                mask = torch.cat([mask, torch.ones(n_new_rows, mask.shape[1], device=mask.device)], dim=0)
-            
-            if n_new_cols > 0:
-                mask = torch.cat([mask, torch.ones(mask.shape[0], n_new_cols, device=mask.device)], dim=1)
-
-            self.connection_masks[layer_idx] = mask
-
-        if hasattr(self, "connection_masks") and self.connection_masks is not None:
-            for layer_idx, mask in self.connection_masks.items():
-                layer = self.layer_stack[layer_idx]
-                assert mask.shape == layer.weight.shape, \
-                    f"Mask mismatch at layer {layer_idx}: mask {mask.shape} vs weight {layer.weight.shape}"
-
-    def prune_connections(self, prune_frac=0.05):
         linear_indices = [i for i, l in enumerate(self.layer_stack) if isinstance(l, nn.Linear)]
         hidden_linear_indices = linear_indices[:-1]
 
-        if not hasattr(self, "connection_masks"):
-            self.connection_masks = {}
-
-        for layer_idx in hidden_linear_indices:
-            layer = self.layer_stack[layer_idx]
-            W = layer.weight.data
-
-            # 1. Compute new magnitude mask on active weights only
-            W_flat = W.abs().view(-1)
-            W_active = W_flat[W_flat != 0]
-            if W_active.numel() == 0:
+        for idx, layer_idx in enumerate(hidden_linear_indices):
+            n_regrow = regrow_counts.get(layer_idx, 0)
+            if n_regrow <= 0:
                 continue
-            n_prune = max(1, int(prune_frac * W_active.numel()))
-            threshold, _ = torch.kthvalue(W_active, n_prune)
-            new_mask = (W.abs() >= threshold).float()
 
-            # 2. Get old mask or initialize
-            old_mask = self.connection_masks.get(layer_idx, torch.ones_like(W, device=W.device))
+            layer      = self.layer_stack[layer_idx]
+            next_layer = self.layer_stack[linear_indices[idx + 1]]
+            in_features     = layer.weight.size(1)
+            out_features_next = next_layer.weight.size(0)
+            device = layer.weight.device
 
-            # 3. Extend old mask to current W shape
-            if old_mask.shape != W.shape:
-                if old_mask.shape[0] < W.shape[0]:
-                    n_new_rows = W.shape[0] - old_mask.shape[0]
-                    old_mask = torch.cat([old_mask, torch.ones(n_new_rows, old_mask.shape[1], device=W.device)], dim=0)
-                if old_mask.shape[1] < W.shape[1]:
-                    n_new_cols = W.shape[1] - old_mask.shape[1]
-                    old_mask = torch.cat([old_mask, torch.ones(old_mask.shape[0], n_new_cols, device=W.device)], dim=1)
+            # Incoming connections: exactly n_connections active per new neuron
+            new_weights = torch.zeros(n_regrow, in_features, device=device)
+            for j in range(n_regrow):
+                chosen = torch.randperm(in_features, device=device)[:min(n_connections, in_features)]
+                new_weights[j, chosen] = torch.randn(chosen.numel(), device=device) * weight_scale
 
-            # 4. Combine masks
-            combined_mask = old_mask * new_mask
-            self.connection_masks[layer_idx] = combined_mask
+            layer.weight.data = torch.cat([layer.weight.data, new_weights], dim=0)
+            layer.bias.data   = torch.cat([layer.bias.data, torch.zeros(n_regrow, device=device)], dim=0)
+            layer.out_features = layer.weight.shape[0]
 
-            # 5. Apply mask
-            layer.weight.data *= combined_mask
+            # Outgoing connections: exactly n_connections active per new neuron
+            new_cols = torch.zeros(out_features_next, n_regrow, device=device)
+            for j in range(n_regrow):
+                chosen = torch.randperm(out_features_next, device=device)[:min(n_connections, out_features_next)]
+                new_cols[chosen, j] = torch.randn(chosen.numel(), device=device) * weight_scale
 
-        if hasattr(self, "connection_masks") and self.connection_masks is not None:
-            for layer_idx, mask in self.connection_masks.items():
-                layer = self.layer_stack[layer_idx]
-                assert mask.shape == layer.weight.shape, \
-                    f"Mask mismatch at layer {layer_idx}: mask {mask.shape} vs weight {layer.weight.shape}"
+            next_layer.weight.data = torch.cat([next_layer.weight.data, new_cols], dim=1)
+            next_layer.in_features = next_layer.weight.shape[1]
+
+            # Extend masks: 1 where weight is non-zero, 0 elsewhere
+            if hasattr(self, 'connection_masks'):
+                if layer_idx in self.connection_masks:
+                    self.connection_masks[layer_idx] = torch.cat(
+                        [self.connection_masks[layer_idx], (new_weights != 0).float()], dim=0)
+                next_layer_idx = linear_indices[idx + 1]
+                if next_layer_idx in self.connection_masks:
+                    self.connection_masks[next_layer_idx] = torch.cat(
+                        [self.connection_masks[next_layer_idx], (new_cols != 0).float()], dim=1)

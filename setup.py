@@ -3,14 +3,22 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, random_split
 
 # model parameters
-HIDDEN_LAYERS = [128, 256, 512, 512, 256]
+HIDDEN_LAYERS = [64, 64, 64, 32]
 TRAIN_VAL_SPLIT = 0.8
-TRAIN_FRESH_SPLIT = 0.3
+TRAIN_FRESH_SPLIT = 0.1
 NUM_WORKERS = 4
-BATCH_SIZE = 4000
+BATCH_SIZE = 8000
 
-# clustering
-N_CLUSTERS = 10
+# clustering — upper bound on clusters; actual k is auto-selected by dendrogram gap
+MAX_CLUSTERS = 10
+
+# pruning loop
+N_FINAL_RETRAIN_EPOCHS   = 50
+CROSS_CLUSTER_PRUNE_FRAC = 0.3
+TOPOLOGY_THRESHOLD       = 0.15
+PHASE2_MIN_NEURONS       = 50
+PHASE2_MIN_CONNECTIONS   = 200
+ERROR_THRESHOLD_FRAC     = 1.5
 
 
 def get_device():
