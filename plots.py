@@ -157,50 +157,68 @@ def plot_loss(metrics):
     plt.grid(True)
     plt.show()
 
-def plot_cluster_prototypes_and_diff_all(all_prototypes, model, cluster_map, layer_mapping):
+def plot_cluster_prototypes_and_diff_all(all_prototypes, model, cluster_map, layer_mapping,
+                                          consensus_maps=None):
     """
-    Plot prototypes and difference maps for all clusters.
+    Plot prototypes, difference maps, activation maximization, and (optionally) consensus
+    pixel maps for all clusters.
 
     Args:
         all_prototypes: dict {cluster_id: {'prototype': 28x28 array, 'diff_map': 28x28 array}}
         model:          NeuralNetwork instance
         cluster_map:    {cluster_id: [global_neuron_indices]}
         layer_mapping:  [(layer_name, start_idx, end_idx), ...]
+        consensus_maps: optional dict from compute_cluster_consensus_pixels — if provided,
+                        adds a 4th row showing shared pixel features per cluster.
     """
     n_clusters = len(all_prototypes)
-    fig, axes = plt.subplots(3, n_clusters, figsize=(n_clusters*2, 6))
+    n_rows = 4 if consensus_maps is not None else 3
+    fig, axes = plt.subplots(n_rows, n_clusters, figsize=(n_clusters*2, n_rows*2))
+    if n_clusters == 1:
+        axes = axes.reshape(n_rows, 1)
 
     for i, cluster_id in enumerate(sorted(all_prototypes.keys())):
         proto = all_prototypes[cluster_id]['prototype']
-        diff = all_prototypes[cluster_id]['diff_map']
+        diff  = all_prototypes[cluster_id]['diff_map']
 
-        # Top row = prototype
-        ax_top = axes[0, i] if n_clusters > 1 else axes[0]
+        ax_top = axes[0, i]
         ax_top.imshow(proto, cmap='viridis')
         ax_top.axis('off')
+        ax_top.set_title(f'Cluster {cluster_id}', fontsize=10)
         if i == 0:
             ax_top.set_ylabel('Prototype', fontsize=10)
 
-        # Bottom row = diff map
-        ax_bottom = axes[1, i] if n_clusters > 1 else axes[1]
-        ax_bottom.imshow(diff, cmap='viridis')
-        ax_bottom.axis('off')
+        ax_diff = axes[1, i]
+        ax_diff.imshow(diff, cmap='viridis')
+        ax_diff.axis('off')
         if i == 0:
-            ax_bottom.set_ylabel('Diff Map', fontsize=10)
+            ax_diff.set_ylabel('Diff Map', fontsize=10)
 
-        # Column title = cluster ID
-        ax_top.set_title(f'Cluster {cluster_id}', fontsize=10)
-
-    # Third row = activation maximization
+    # Row 3 — activation maximization
     for i, cluster_id in enumerate(sorted(all_prototypes.keys())):
         act_max = am.visualize_cluster(model, cluster_map, layer_mapping, cluster_id, show=False)
-        ax_act = axes[2, i] if n_clusters > 1 else axes[2]
+        ax_act = axes[2, i]
         ax_act.imshow(act_max, cmap='gray')
         ax_act.axis('off')
         if i == 0:
             ax_act.set_ylabel('Activation Max', fontsize=10)
 
-    plt.suptitle('All Clusters - Prototypes, Difference Maps & Activation Maximization', fontsize=12)
+    # Row 4 — consensus pixel map (optional)
+    if consensus_maps is not None:
+        for i, cluster_id in enumerate(sorted(all_prototypes.keys())):
+            ax_con = axes[3, i]
+            if cluster_id in consensus_maps:
+                ax_con.imshow(consensus_maps[cluster_id]['consensus'], cmap='gray_r')
+            else:
+                ax_con.imshow(np.zeros((28, 28)), cmap='gray_r')
+            ax_con.axis('off')
+            if i == 0:
+                ax_con.set_ylabel('Digit\nConsensus', fontsize=10)
+
+    title = 'All Clusters — Prototypes, Diff Maps, Activation Max'
+    if consensus_maps is not None:
+        title += ', Consensus Pixels'
+    plt.suptitle(title, fontsize=12)
     plt.tight_layout()
     plt.show()
 
@@ -231,6 +249,43 @@ def plot_cluster_entropy(selectivity_results):
     plt.xticks(cluster_ids, rotation=45)
 
     plt.show()
+
+def plot_cluster_consensus_all(consensus_maps, cluster_map, cluster_digit_counts=None):
+    """
+    Plot consensus pixel maps for all clusters in a single row.
+
+    Each panel shows, for the images that activate a given cluster, what pixel
+    patterns are consistently present (dark = shared by most images).
+
+    Args:
+        consensus_maps:       {cluster_id: {'consensus': np.array [28,28], 'n_images': int}}
+        cluster_map:          {cluster_id: [neuron_indices]}  (used for ordering)
+        cluster_digit_counts: optional {cluster_id: np.array [10]} — annotates each
+                              subplot with the dominant digit for that cluster.
+    """
+    cluster_ids = sorted(consensus_maps.keys())
+    n_clusters  = len(cluster_ids)
+    if n_clusters == 0:
+        return
+
+    fig, axes = plt.subplots(1, n_clusters, figsize=(n_clusters * 2, 2.5))
+    if n_clusters == 1:
+        axes = [axes]
+
+    for ax, cid in zip(axes, cluster_ids):
+        info = consensus_maps[cid]
+        ax.imshow(info['consensus'], cmap='gray_r', vmin=0, vmax=1)
+        title = f"C{cid}\nn={info['n_images']}"
+        if cluster_digit_counts is not None and cid in cluster_digit_counts:
+            top_digit = int(np.argmax(cluster_digit_counts[cid]))
+            title += f"\ntop:{top_digit}"
+        ax.set_title(title, fontsize=8)
+        ax.axis('off')
+
+    plt.suptitle('Cluster consensus pixels  (dark = shared features)', fontsize=11)
+    plt.tight_layout()
+    plt.show()
+
 
 def plot_cluster_prob_distribution(selectivity_results, cluster_id):
     probs = selectivity_results[cluster_id]['prob_distribution']

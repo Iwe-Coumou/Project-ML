@@ -6,75 +6,6 @@ import copy
 from torch import nn
 from torch.utils.data import ConcatDataset, DataLoader
 
-def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_loader, cluster_id, device=None):
-    device = device or model.device
-    model.eval()
-
-    # Get all labels
-    all_labels = []
-    for _, y in data_loader:
-        all_labels.append(y)
-    all_labels = torch.cat(all_labels).to(device)
-
-    print(f"\n--- Calculating pre and post-ablation accuracy for cluster {cluster_id} ---")
-
-    # Original predictions and per-class accuracy
-    orig_preds = model.predict(data_loader).to(device)
-
-    class_total = defaultdict(int)
-    class_correct = defaultdict(int)
-    for t, p in zip(all_labels, orig_preds):
-        class_total[int(t)] += 1
-        if t == p:
-            class_correct[int(t)] += 1
-    orig_acc_per_class = {cls: class_correct[cls]/class_total[cls] for cls in class_total}
-
-    # Backup ALL layers (current and next)
-    linear_indices = [i for i, l in enumerate(model.layer_stack) if isinstance(l, torch.nn.Linear)]
-    layer_backups = {}
-    for linear_layer_idx in linear_indices:
-        layer = model.layer_stack[linear_layer_idx]
-        layer_backups[linear_layer_idx] = {
-            'weight': layer.weight.data.clone(),
-            'bias': layer.bias.data.clone()
-        }
-
-    # Ablate neurons
-    for layer_name, start_idx, end_idx in layer_mapping:
-        layer_idx = int(layer_name.split('_')[1])
-        linear_layer_idx = linear_indices[layer_idx]
-        layer = model.layer_stack[linear_layer_idx]
-
-        local_indices = [i - start_idx for i in cluster_indices if start_idx <= i < end_idx]
-        if not local_indices:
-            continue
-
-        layer.weight.data[local_indices, :] = 0
-        layer.bias.data[local_indices] = 0
-
-        if layer_idx + 1 < len(linear_indices):
-            next_layer = model.layer_stack[linear_indices[layer_idx + 1]]
-            next_layer.weight.data[:, local_indices] = 0
-
-    # Predictions after ablation
-    ablated_preds = model.predict(data_loader).to(device)
-    class_correct_after = defaultdict(int)
-    for t, p in zip(all_labels, ablated_preds):
-        if t == p:
-            class_correct_after[int(t)] += 1
-    acc_per_class_after = {cls: class_correct_after[cls]/class_total[cls] for cls in class_total}
-
-    # Restore ALL layers
-    for linear_layer_idx, backup in layer_backups.items():
-        layer = model.layer_stack[linear_layer_idx]
-        layer.weight.data = backup['weight']
-        layer.bias.data = backup['bias']
-
-    return {
-        'pre': orig_acc_per_class,
-        'post': acc_per_class_after
-    }
-
 def remove_dead_neurons(model):
     """
     Remove neurons whose incoming AND outgoing connections are all zero.
@@ -680,6 +611,92 @@ def _measure_cluster_ablation(model, cluster_map, layer_mapping, val_loader, dev
     return drops
 
 
+def cluster_digit_alignment(model, loader, cluster_map, layer_mapping, device):
+    """
+    Measure how selectively each cluster responds to digit classes.
+
+    For each sample, assigns it to the cluster with the highest mean activation,
+    then computes per-cluster digit distributions. Reports an alignment score per
+    cluster: 1.0 = fires for exactly one digit class, 0.0 = uniform across all.
+
+    Returns (cluster_digit_counts, mean_alignment_score).
+    """
+    from scipy.stats import entropy as scipy_entropy
+
+    # Collect labels (cheap CPU pass)
+    all_labels = []
+    for _, y in loader:
+        all_labels.append(y)
+    all_labels = torch.cat(all_labels).numpy()  # [N]
+
+    # Get per-sample activations for all primitive layers (exclude layer_0)
+    layer_data = model.get_layer_data(loader)
+    prim_data = {k: v for k, v in layer_data.items() if k != 'layer_0'}
+    if not prim_data or not cluster_map:
+        return {}, 0.0
+
+    n_samples = all_labels.shape[0]
+    n_digits  = 10
+
+    # Build per-cluster mean activation for every sample: [n_samples, n_clusters]
+    cluster_ids = sorted(cluster_map.keys())
+    cluster_acts = np.zeros((n_samples, len(cluster_ids)), dtype=np.float32)
+
+    for col, cid in enumerate(cluster_ids):
+        neuron_indices = cluster_map[cid]
+        layer_vecs = []
+        for lname, start, end in layer_mapping:
+            if lname not in prim_data:
+                continue
+            local_idxs = [gi - start for gi in neuron_indices if start <= gi < end]
+            if not local_idxs:
+                continue
+            act_size = prim_data[lname]['post_activation'].shape[1]
+            local_idxs = [i for i in local_idxs if i < act_size]
+            if not local_idxs:
+                continue
+            acts = prim_data[lname]['post_activation'][:, local_idxs]  # [N, k]
+            layer_vecs.append(acts.numpy())
+        if layer_vecs:
+            combined = np.concatenate(layer_vecs, axis=1)  # [N, total_neurons_in_cluster]
+            cluster_acts[:, col] = combined.mean(axis=1)
+
+    # Assign each sample to its highest-mean cluster
+    assigned_col = cluster_acts.argmax(axis=1)  # [N] — index into cluster_ids list
+
+    # Count digit occurrences per cluster
+    cluster_digit_counts = {cid: np.zeros(n_digits, dtype=np.int32) for cid in cluster_ids}
+    for i in range(n_samples):
+        cid = cluster_ids[assigned_col[i]]
+        cluster_digit_counts[cid][all_labels[i]] += 1
+
+    # Compute alignment score per cluster
+    scores = {}
+    for cid in cluster_ids:
+        counts = cluster_digit_counts[cid].astype(float)
+        total  = counts.sum()
+        if total == 0:
+            scores[cid] = 0.0
+            continue
+        p = counts / total
+        scores[cid] = float(1.0 - scipy_entropy(p + 1e-12) / np.log(n_digits))
+
+    mean_score = float(np.mean(list(scores.values()))) if scores else 0.0
+
+    # Print as aligned matrix
+    col_w = 6
+    header = "".join(f"{'d'+str(d):>{col_w}}" for d in range(n_digits)) + f"{'score':>{col_w}}"
+    print(f"  Cluster-digit alignment (mean score={mean_score:.3f}):")
+    print(f"  {'':8}{header}")
+    for cid in cluster_ids:
+        counts = cluster_digit_counts[cid]
+        row    = "".join(f"{int(c):>{col_w}}" for c in counts)
+        row   += f"{scores[cid]:>{col_w}.3f}"
+        print(f"  C{cid:<7}{row}")
+
+    return cluster_digit_counts, mean_score
+
+
 def error_driven_regrowth(model, cluster_map, layer_mapping, val_loader,
                           threshold_frac, device, n_spawn=1):
     """
@@ -834,7 +851,7 @@ def _finalise(model, loader_to_use, train_loader, lr, n_final_retrain_epochs, ma
     """
     Post-pruning finalisation:
       1. Run cluster_neurons_fabio once on the compressed model to discover structure.
-      2. Cut ALL cross-cluster connections based on those structural components.
+      2. Cut ALL cross-cluster connections only if alignment is high enough (gate).
       3. Final retrain.
     """
     print(f"\nFinalising: discovering structure in compressed model...")
@@ -851,12 +868,27 @@ def _finalise(model, loader_to_use, train_loader, lr, n_final_retrain_epochs, ma
             print(f"  Found {len(cluster_map)} structural cluster(s).")
             for cid in sorted(cluster_map):
                 print(f"    Cluster {cid}: {len(cluster_map[cid])} neurons")
+            if len(cluster_map) > 1:
+                _, align_score = cluster_digit_alignment(
+                    model, loader_to_use, cluster_map, layer_mapping, model.device)
+                model.final_alignment_score = align_score
         except Exception as e:
             print(f"  cluster_neurons_fabio failed ({e}), skipping isolation cut.")
 
+    if not hasattr(model, 'final_alignment_score'):
+        model.final_alignment_score = 0.0
+
+    # Store on model so hyperparameter search can access alignment scores
+    model.final_cluster_map   = cluster_map
+    model.final_layer_mapping = layer_mapping
+
+    MIN_ALIGNMENT_FOR_CUT = 0.15
     if cluster_map is not None and len(cluster_map) > 1:
-        print("  Cutting all cross-cluster connections...")
-        cut_all_cross_cluster_connections(model, cluster_map, layer_mapping)
+        if model.final_alignment_score >= MIN_ALIGNMENT_FOR_CUT:
+            print(f"  Alignment {model.final_alignment_score:.3f} >= {MIN_ALIGNMENT_FOR_CUT} — cutting cross-cluster connections...")
+            cut_all_cross_cluster_connections(model, cluster_map, layer_mapping)
+        else:
+            print(f"  Alignment {model.final_alignment_score:.3f} < {MIN_ALIGNMENT_FOR_CUT} — skipping isolation cut.")
     else:
         print("  Single component or no clusters — skipping isolation cut.")
 
@@ -868,7 +900,7 @@ def _finalise(model, loader_to_use, train_loader, lr, n_final_retrain_epochs, ma
 
     model.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     print(f"Final retraining ({n_final_retrain_epochs} epochs)...")
-    model.train_model(loader_to_use, epochs=n_final_retrain_epochs, lr=lr, val_interval=1, patience=20)
+    model.train_model(loader_to_use, epochs=n_final_retrain_epochs, lr=lr, val_interval=1, patience=25)
     return model
 
 
@@ -980,6 +1012,9 @@ def pruning(model, train_loader, val_loader, parameters, baseline_acc,
                     )
                     print(f"  Structural clusters: {n_clusters} — {sizes_str}")
                     cluster_found = n_clusters > 1
+                    if cluster_found:
+                        cluster_digit_alignment(current_model, diag_loader, current_cluster_map,
+                                                current_layer_mapping, current_model.device)
                 except Exception as e:
                     print(f"  cluster_neurons_fabio failed ({e}) — skipping clustering this round.")
                     prev_cluster_map = current_cluster_map
@@ -1293,102 +1328,3 @@ def split_clusters_by_layer(cluster_map, layer_mapping):
                 break
 
     return result
-
-
-def compute_cluster_selectivity(cluster_map, all_activation, labels, n_classes=10):
-    results = {}
-
-    for cluster_id, neuron_indices in cluster_map.items():
-
-        cluster_acts = all_activation[:,neuron_indices]
-        cluster_strength = cluster_acts.mean(dim=1)
-
-        class_means = []
-        class_totals = []
-
-        for c in range(n_classes):
-            mask = (labels == c)
-            class_strength = cluster_strength[mask]
-
-            mean_activation = class_strength.mean().item()
-            total_activation = class_strength.sum().item()
-
-            class_means.append(mean_activation)
-            class_totals.append(total_activation)
-
-        class_totals = np.array(class_totals)
-
-        if class_totals.sum() > 0:
-            prob_dist = class_totals / class_totals.sum()
-        else:
-            prob_dist = np.zeros(n_classes)
-
-        entropy = -np.sum(prob_dist*np.log(prob_dist+1e-12))
-
-        max_entropy = np.log(n_classes)
-        normalized_entropy = entropy / max_entropy
-
-        results[cluster_id] = {
-            "mean_activation_per_class": class_means,
-            "prob_distribution": prob_dist,
-            "entropy": entropy,
-            "normalized_entropy": normalized_entropy
-        }
-
-    return results
-
-
-def compute_prototypes_all_clusters(cluster_map, all_activations, images, top_frac=0.1, use_global_mean=True):
-    """
-    Compute prototypes and difference maps for all clusters across all images (no class stratification).
-
-    Args:
-        cluster_map: dict {cluster_id: list of neuron indices}
-        all_activations: tensor (N_samples, total_neurons)
-        images: tensor (N_samples, 1, 28, 28)
-        top_frac: fraction of top-activating samples to average
-        use_global_mean: if True, difference map relative to global mean, else cluster mean
-
-    Returns:
-        dict: cluster_id -> {'prototype': 28x28 array, 'diff_map': 28x28 array}
-    """
-    N_samples = images.shape[0]
-    flat_images = images.view(N_samples, -1)
-
-    # Precompute global mean if needed
-    if use_global_mean:
-        global_mean = flat_images.mean(dim=0).view(28,28)
-        global_mean = (global_mean - global_mean.min()) / (global_mean.max() - global_mean.min() + 1e-8)
-        global_mean_np = global_mean.cpu().numpy()
-
-    all_prototypes = {}
-
-    for cluster_id, cluster_indices in cluster_map.items():
-        cluster_acts = all_activations[:, cluster_indices]
-        cluster_strength = cluster_acts.mean(dim=1)
-
-        # Top-k averaging across all samples
-        k = max(1, int(top_frac * len(cluster_strength)))
-        _, top_idx = torch.topk(cluster_strength, k)
-
-        proto = images[top_idx].mean(dim=0).squeeze()
-        proto = (proto - proto.min()) / (proto.max() - proto.min() + 1e-8)
-        proto_np = proto.cpu().numpy()
-
-        # Difference map
-        if use_global_mean:
-            mean_np = global_mean_np
-        else:
-            cluster_mean = images.mean(dim=0).squeeze()
-            cluster_mean = (cluster_mean - cluster_mean.min()) / (cluster_mean.max() - cluster_mean.min() + 1e-8)
-            mean_np = cluster_mean.cpu().numpy()
-
-        diff_map = proto_np - mean_np
-        diff_map = (diff_map - diff_map.min()) / (diff_map.max() - diff_map.min() + 1e-8)
-
-        all_prototypes[cluster_id] = {
-            'prototype': proto_np,
-            'diff_map': diff_map
-        }
-
-    return all_prototypes
