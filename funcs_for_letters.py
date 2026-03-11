@@ -12,14 +12,23 @@ Also provides data loading (EMNIST letters) and a comparison helper.
 """
 
 import copy
+import threading
 import torch
 import torch.nn as nn
 import torch.nn.init as init
 import numpy as np
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset, TensorDataset
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from NeuralNetwork import NeuralNetwork
+
+# Thread-safe print to avoid garbled output from parallel variant training
+_PRINT_LOCK = threading.Lock()
+
+def _tprint(*args, **kwargs):
+    with _PRINT_LOCK:
+        print(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -28,7 +37,7 @@ from NeuralNetwork import NeuralNetwork
 
 def get_letters_dataloaders(batch_size=8000, val_frac=0.1):
     """
-    Load EMNIST 'letters' split (26 classes, labels 1-26 → remapped to 0-25).
+    Load EMNIST 'byclass' split filtered to lowercase a-z (classes 36-61 → remapped to 0-25).
 
     Applies the same rotate-then-flip transform used for the digit dataset so
     the pixel orientation is consistent.
@@ -48,16 +57,21 @@ def get_letters_dataloaders(batch_size=8000, val_frac=0.1):
         transforms.Lambda(flip_image),
     ])
 
-    # EMNIST letters labels are 1-26; shift to 0-25 for CrossEntropyLoss
-    target_transform = transforms.Lambda(lambda y: y - 1)
+    # byclass: digits 0-9, uppercase A-Z (10-35), lowercase a-z (36-61)
+    # shift lowercase labels to 0-25
+    target_transform = transforms.Lambda(lambda y: y - 36)
 
     train_full = datasets.EMNIST(
-        root="./data", split="letters", train=True,
+        root="./data", split="byclass", train=True,
         download=True, transform=transform, target_transform=target_transform)
 
     test_dataset = datasets.EMNIST(
-        root="./data", split="letters", train=False,
+        root="./data", split="byclass", train=False,
         download=True, transform=transform, target_transform=target_transform)
+
+    # Filter to lowercase only at dataloader level (raw targets before transform)
+    train_full   = Subset(train_full,   (train_full.targets >= 36).logical_and(train_full.targets <= 61).nonzero(as_tuple=True)[0])
+    test_dataset = Subset(test_dataset, (test_dataset.targets >= 36).logical_and(test_dataset.targets <= 61).nonzero(as_tuple=True)[0])
 
     n_val   = int(val_frac * len(train_full))
     n_train = len(train_full) - n_val
@@ -69,7 +83,7 @@ def get_letters_dataloaders(batch_size=8000, val_frac=0.1):
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size)
     test_loader  = DataLoader(test_dataset,  batch_size=batch_size)
 
-    print(f"Letters — train: {n_train}, val: {n_val}, test: {len(test_dataset)}")
+    print(f"Letters (lowercase only) — train: {n_train}, val: {n_val}, test: {len(test_dataset)}")
     return train_loader, val_loader, test_loader
 
 
@@ -407,3 +421,874 @@ def _arch_str(model):
     sizes   = [model.layer_stack[lin_idx[0]].in_features]
     sizes  += [model.layer_stack[i].out_features for i in lin_idx]
     return " → ".join(str(s) for s in sizes)
+
+
+# ---------------------------------------------------------------------------
+# Experiment — six-variant multi-seed comparison
+# ---------------------------------------------------------------------------
+
+_VARIANTS = [
+    'frozen_transfer',
+    'frozen_regrowth',
+    'unfrozen_transfer',
+    'fc_baseline',
+    'random_frozen',
+    'random_frozen_regrowth',
+]
+
+
+def build_random_frozen_model(pruned_model, n_letters=26):
+    """
+    Same sparse architecture as the transfer model but all hidden weights
+    randomly initialised from the empirical weight distribution of the pruned
+    model (std of non-zero hidden weights), then frozen.  Layer-0 is reset
+    (Xavier), output is fresh.
+
+    Control condition: same topology + same weight scale, no digit knowledge.
+    """
+    device  = pruned_model.device
+    h_sizes = _hidden_sizes(pruned_model)
+    model   = NeuralNetwork(input_size=784, hidden_sizes=h_sizes,
+                             output_size=n_letters, device=device)
+
+    lin_src = _linear_indices(pruned_model)
+    lin_dst = _linear_indices(model)
+
+    # Empirical std from pruned hidden-layer non-zero weights
+    all_w = []
+    for k in range(1, len(lin_src) - 1):
+        w  = pruned_model.layer_stack[lin_src[k]].weight.data
+        nz = w[w != 0]
+        if nz.numel() > 0:
+            all_w.append(nz.abs().cpu())
+    emp_std = float(torch.cat(all_w).std()) if all_w else 0.02
+
+    # Copy sparsity masks then re-init hidden weights from N(0, emp_std)
+    _copy_connection_masks(pruned_model, model, lin_src, lin_dst)
+    for k in range(1, len(lin_dst) - 1):
+        ls_idx = lin_dst[k]
+        layer  = model.layer_stack[ls_idx]
+        layer.weight.data.normal_(mean=0.0, std=emp_std)
+        layer.bias.data.zero_()
+        if hasattr(model, 'connection_masks') and ls_idx in model.connection_masks:
+            layer.weight.data *= model.connection_masks[ls_idx]
+
+    # Reset layer-0 (Xavier)
+    init.xavier_uniform_(model.layer_stack[lin_dst[0]].weight)
+    init.zeros_(model.layer_stack[lin_dst[0]].bias)
+
+    # Freeze hidden layers
+    for ls_idx in lin_dst[1:-1]:
+        model.layer_stack[ls_idx].weight.requires_grad_(False)
+        model.layer_stack[ls_idx].bias.requires_grad_(False)
+
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Random-frozen model: {_arch_str(model)}  (emp_std={emp_std:.4f}  trainable={n_trainable})")
+    return model
+
+
+def _preload_to_tensors(dataset, batch_size=4096):
+    """
+    Apply all dataset transforms once and cache the result as CPU float tensors.
+
+    EMNIST transforms (ToTensor + rotate + flip) run in Python per image on every
+    DataLoader iteration.  Pre-loading executes them once and stores the result as
+    a plain tensor, so subsequent DataLoader iterations over the returned
+    TensorDataset are pure C++ tensor slices — zero Python/PIL overhead.
+
+    Returns: (X [N,1,28,28] float32, y [N] long) on CPU.
+    """
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    Xs, ys = [], []
+    for X, y in loader:
+        Xs.append(X)
+        ys.append(y)
+    return torch.cat(Xs), torch.cat(ys).long()
+
+
+def _frozen_layer_row_counts(model):
+    """Return {layer_stack_idx: current_n_rows} for all hidden linear layers."""
+    lin = _linear_indices(model)
+    return {lin[k]: model.layer_stack[lin[k]].weight.shape[0]
+            for k in range(1, len(lin) - 1)}
+
+
+def _train_one_epoch(model, loader, criterion, device, l1_lambda=1e-5):
+    """
+    One forward+backward pass through loader.
+    Mirrors NeuralNetwork.train_model: respects connection_masks and L1 reg.
+    Returns mean batch loss.
+    """
+    model.train()
+    if model.optimizer is None:
+        model.optimizer = torch.optim.Adam(
+            [p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    total_loss = 0.0
+    for X, y in loader:
+        X, y = X.to(device), y.to(device)
+        logits = model(X)
+        l1 = torch.stack([p.abs().sum() for p in model.parameters()]).sum()
+        loss = criterion(logits, y) + l1_lambda * l1
+        model.optimizer.zero_grad()
+        loss.backward()
+        if hasattr(model, 'connection_masks') and model.connection_masks:
+            for li, mask in model.connection_masks.items():
+                p = model.layer_stack[li].weight
+                if p.grad is not None:
+                    p.grad.data *= mask.to(p.grad.device)
+        model.optimizer.step()
+        total_loss += loss.item()
+    return total_loss / max(len(loader), 1)
+
+
+def _eval_acc(model, loader):
+    """Accuracy without tqdm noise."""
+    model.eval()
+    correct = total = 0
+    with torch.no_grad():
+        for X, y in loader:
+            X, y = X.to(model.device), y.to(model.device)
+            preds = model(X).argmax(dim=1)
+            correct += (preds == y).sum().item()
+            total   += y.size(0)
+    return correct / total if total > 0 else 0.0
+
+
+def _make_partial_freeze_hook(n_frozen):
+    """Gradient hook: zero gradient entries for indices < n_frozen."""
+    def hook(grad):
+        if n_frozen <= 0:
+            return grad
+        g = grad.clone()
+        g[:n_frozen] = 0.0
+        return g
+    return hook
+
+
+def _refreeze_after_regrowth(model, frozen_row_counts):
+    """
+    After error_driven_regrowth has extended hidden layer tensors, re-enable
+    requires_grad and register gradient hooks that keep the ORIGINAL rows frozen
+    while letting newly added rows train freely.
+
+    Args:
+        frozen_row_counts: {layer_stack_idx: n_rows_to_keep_frozen}
+                           Captured before any regrowth in this run.
+    """
+    for handle in getattr(model, '_freeze_hook_handles', []):
+        handle.remove()
+    model._freeze_hook_handles = []
+
+    for ls_idx, n_frozen in frozen_row_counts.items():
+        layer = model.layer_stack[ls_idx]
+        layer.weight.requires_grad_(True)
+        layer.bias.requires_grad_(True)
+        hw = layer.weight.register_hook(_make_partial_freeze_hook(n_frozen))
+        hb = layer.bias.register_hook(_make_partial_freeze_hook(n_frozen))
+        model._freeze_hook_handles.extend([hw, hb])
+
+    model.optimizer = None  # caller must rebuild Adam
+
+
+def _run_simple_half(model, loader, val_loader, n_epochs, criterion, device, lr, label=''):
+    """Train n_epochs, return per-epoch val_acc list."""
+    if model.optimizer is None:
+        model.optimizer = torch.optim.Adam(
+            [p for p in model.parameters() if p.requires_grad], lr=lr)
+    curves = []
+    for ep in range(n_epochs):
+        _train_one_epoch(model, loader, criterion, device)
+        acc = _eval_acc(model, val_loader)
+        curves.append(acc)
+        _tprint(f"    {label}ep {ep+1}/{n_epochs}  val={acc:.4f}")
+    return curves
+
+
+def _run_regrowth_half(model, loader, val_loader, n_epochs, criterion, device, lr,
+                        cluster_map, layer_mapping, threshold_frac, n_spawn,
+                        frozen_row_counts, regrowth_interval=5, label=''):
+    """
+    Train n_epochs with error_driven_regrowth every `regrowth_interval` epochs.
+    cluster_map is modified in-place (new neurons appended by regrowth).
+    Calling regrowth every epoch is wasteful: one epoch rarely changes which
+    clusters are underperforming, but each call runs a full forward pass through
+    the val set once per cluster.  Checking every 5 epochs gives the same
+    signal at 5x lower cost.
+    """
+    import funcs as _funcs
+    model.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    curves = []
+    for ep in range(n_epochs):
+        _train_one_epoch(model, loader, criterion, device)
+        n_added = 0
+        if (ep + 1) % regrowth_interval == 0:
+            n_added = _funcs.error_driven_regrowth(
+                model, cluster_map, layer_mapping,
+                val_loader, threshold_frac, device, n_spawn)
+            if n_added > 0:
+                _refreeze_after_regrowth(model, frozen_row_counts)
+                model.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        acc = _eval_acc(model, val_loader)
+        curves.append(acc)
+        marker = f'  +{n_added} neurons' if n_added else ''
+        _tprint(f"    {label}ep {ep+1}/{n_epochs}  val={acc:.4f}{marker}")
+    return curves
+
+
+def _run_variant_full(name, model, h1_ds, h2_ds, val_ds, batch_size,
+                      n_epochs_half, criterion, device, lr,
+                      cluster_map, layer_mapping, threshold_frac, n_spawn,
+                      frozen_row_counts, regrowth_interval):
+    """
+    Run both halves for a single variant.  Designed to be called from a thread.
+
+    Each thread receives **dataset** objects (not DataLoader objects) and builds
+    its own independent DataLoaders locally.  This avoids GIL contention that
+    occurs when multiple threads share and iterate the same DataLoader: with
+    num_workers=0 each `for X, y in loader` call holds the GIL to load data, so
+    shared loaders serialize across threads and add switching overhead on top.
+    Per-thread loaders give each variant its own iteration state with no sharing.
+
+    Args:
+        h1_ds, h2_ds, val_ds: Dataset objects (not loaders)
+        batch_size:            used when building the per-thread loaders
+        cluster_map:           None for non-regrowth variants; deep-copied dict for
+                               regrowth variants (modified in-place by regrowth).
+        frozen_row_counts:     None for non-regrowth variants.
+
+    Returns:
+        (name, full_curve)   where full_curve has length 2*n_epochs_half.
+    """
+    # Build independent loaders for this thread
+    h1_loader  = DataLoader(h1_ds,  batch_size=batch_size, shuffle=True,  num_workers=0)
+    h2_loader  = DataLoader(h2_ds,  batch_size=batch_size, shuffle=True,  num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    model.optimizer = None
+    _tprint(f"\n[{name}] starting half 1")
+    c1 = _run_simple_half(model, h1_loader, val_loader, n_epochs_half,
+                           criterion, device, lr, label=f'{name} h1 ')
+
+    _tprint(f"\n[{name}] starting half 2")
+    if cluster_map is not None:
+        c2 = _run_regrowth_half(model, h2_loader, val_loader, n_epochs_half,
+                                 criterion, device, lr,
+                                 cluster_map, layer_mapping,
+                                 threshold_frac, n_spawn, frozen_row_counts,
+                                 regrowth_interval=regrowth_interval,
+                                 label=f'{name} h2 ')
+    else:
+        c2 = _run_simple_half(model, h2_loader, val_loader, n_epochs_half,
+                               criterion, device, lr, label=f'{name} h2 ')
+
+    _tprint(f"[{name}] done  final_val={c2[-1]:.4f}")
+    return name, c1 + c2
+
+
+def run_experiment(pruned_model, n_seeds=5, n_epochs_half=50, lr=1e-3,
+                   batch_size=4096, threshold_frac=1.5, n_spawn=5,
+                   regrowth_interval=5, device=None):
+    """
+    Run six transfer-learning variants on EMNIST letters with multiple seeds,
+    training all six variants in parallel within each seed.
+
+    Training is split into two equal halves of n_epochs_half epochs each.
+    Regrowth variants call funcs.error_driven_regrowth every `regrowth_interval`
+    epochs in half 2 (default every 5 epochs, not every epoch — one epoch is
+    rarely enough to change which clusters are underperforming, so checking
+    every epoch wastes n_clusters forward passes per epoch for no benefit).
+
+    All six variants run concurrently using a ThreadPoolExecutor.  Each variant
+    owns its own model and cluster_map copy so there is no shared mutable state.
+    PyTorch gives each thread its own CUDA stream, so GPU work from different
+    variants can overlap automatically.
+
+    Variants
+    --------
+    frozen_transfer        — frozen hidden layers, no regrowth
+    frozen_regrowth        — frozen hidden layers, regrowth in half 2
+    unfrozen_transfer      — all layers trainable
+    fc_baseline            — fully-connected MLP, same width
+    random_frozen          — empirical-distribution weights, frozen, no regrowth
+    random_frozen_regrowth — same, with regrowth in half 2
+
+    Args:
+        regrowth_interval: how many epochs between regrowth checks (default 5)
+
+    Returns
+    -------
+    dict with keys = variant names plus '_meta', each variant having:
+        'curves':   list of n_seeds lists, each of length 2*n_epochs_half
+        'ablation': list of n_seeds dicts {cluster_id: mean_letter_drop}
+                    (only populated for regrowth variants)
+    """
+    import analysis as _analysis
+
+    device = device or pruned_model.device
+    cluster_map_orig = getattr(pruned_model, 'final_cluster_map',  None) or {}
+    layer_mapping    = getattr(pruned_model, 'final_layer_mapping', None) or []
+    criterion        = nn.CrossEntropyLoss()
+
+    results = {v: {'curves': [], 'ablation': []} for v in _VARIANTS}
+    results['_meta'] = {
+        'n_epochs_half': n_epochs_half,
+        'n_seeds': n_seeds,
+        'regrowth_interval': regrowth_interval,
+    }
+
+    # Pre-load all data into CPU tensors once.
+    # EMNIST transforms (PIL rotate/flip/ToTensor) run in Python per image on every
+    # DataLoader iteration.  Loading here applies them once and stores raw float tensors,
+    # so per-thread DataLoaders use TensorDataset whose __getitem__ is a pure C++ tensor
+    # slice — zero Python/PIL overhead, no GIL contention on data loading.
+    train_loader_base, val_loader_base, _ = get_letters_dataloaders(batch_size=batch_size)
+    train_dataset = train_loader_base.dataset   # Subset from random_split(seed=42)
+    val_ds        = val_loader_base.dataset
+
+    _tprint("Pre-loading letter data into CPU tensors (one-time, applies transforms)...")
+    train_X, train_y = _preload_to_tensors(train_dataset, batch_size=batch_size)
+    val_X,   val_y   = _preload_to_tensors(val_ds,        batch_size=batch_size)
+    val_ds_tensor    = TensorDataset(val_X, val_y)
+    _tprint(f"  train: {train_X.shape}  val: {val_X.shape}")
+
+    for seed in range(n_seeds):
+        _tprint(f"\n{'='*60}\nSEED {seed}\n{'='*60}")
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
+        # Seed-dependent half split — index into preloaded tensors
+        n_total = len(train_X)
+        n_h1    = n_total // 2
+        n_h2    = n_total - n_h1
+        gen     = torch.Generator().manual_seed(seed)
+        perm    = torch.randperm(n_total, generator=gen)
+        h1_idx, h2_idx = perm[:n_h1], perm[n_h1:]
+        h1_ds_tensor = TensorDataset(train_X[h1_idx], train_y[h1_idx])
+        h2_ds_tensor = TensorDataset(train_X[h2_idx], train_y[h2_idx])
+
+        # Per-seed cluster map copies for regrowth variants
+        cmap_fr  = copy.deepcopy(cluster_map_orig)
+        cmap_rfr = copy.deepcopy(cluster_map_orig)
+
+        # ── Build all six models ─────────────────────────────────────────────
+        m_ft  = build_transfer_model(pruned_model)
+        m_fr  = build_transfer_model(pruned_model)
+        m_uf  = build_transfer_model(pruned_model)
+        m_fc  = build_fc_benchmark(pruned_model)
+        m_rf  = build_random_frozen_model(pruned_model)
+        m_rfr = build_random_frozen_model(pruned_model)
+
+        # Unfreeze all hidden layers for unfrozen_transfer
+        for ls_idx in _linear_indices(m_uf)[1:-1]:
+            m_uf.layer_stack[ls_idx].weight.requires_grad_(True)
+            m_uf.layer_stack[ls_idx].bias.requires_grad_(True)
+
+        # Frozen row counts captured before any regrowth
+        frc_fr  = _frozen_layer_row_counts(m_fr)
+        frc_rfr = _frozen_layer_row_counts(m_rfr)
+
+        # ── Variant specs: (name, model, cmap_or_None, frc_or_None) ─────────
+        variant_specs = [
+            ('frozen_transfer',        m_ft,  None,      None),
+            ('frozen_regrowth',        m_fr,  cmap_fr,   frc_fr),
+            ('unfrozen_transfer',      m_uf,  None,      None),
+            ('fc_baseline',            m_fc,  None,      None),
+            ('random_frozen',          m_rf,  None,      None),
+            ('random_frozen_regrowth', m_rfr, cmap_rfr,  frc_rfr),
+        ]
+
+        # ── Train all six variants in parallel ───────────────────────────────
+        _tprint(f"\n-- Training all 6 variants in parallel (regrowth every "
+                f"{regrowth_interval} epochs) --")
+        seed_curves = {}
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {
+                pool.submit(
+                    _run_variant_full,
+                    name, m, h1_ds_tensor, h2_ds_tensor, val_ds_tensor, batch_size,
+                    n_epochs_half, criterion, device, lr,
+                    cmap, layer_mapping, threshold_frac, n_spawn, frc,
+                    regrowth_interval,
+                ): name
+                for name, m, cmap, frc in variant_specs
+            }
+            for future in as_completed(futures):
+                vname, curve = future.result()
+                seed_curves[vname] = curve
+
+        for name in _VARIANTS:
+            results[name]['curves'].append(seed_curves[name])
+
+        # ── Ablation (regrowth variants only) — run after training ───────────
+        _tprint("\n-- Ablation --")
+        ablation_val_loader = DataLoader(val_ds_tensor, batch_size=batch_size, shuffle=False, num_workers=0)
+        for name, m, cmap in [
+            ('frozen_regrowth',        m_fr,  cmap_fr),
+            ('random_frozen_regrowth', m_rfr, cmap_rfr),
+        ]:
+            _tprint(f"  [{name}]")
+            drop_dict = {}
+            for cid, neurons in cmap.items():
+                res = _analysis.cluster_criticality_per_class(
+                    m, neurons, layer_mapping, ablation_val_loader, cid, device=device)
+                mean_drop = float(np.mean(
+                    [res['pre'][c] - res['post'][c] for c in res['pre']]))
+                drop_dict[int(cid)] = round(mean_drop, 4)
+            results[name]['ablation'].append(drop_dict)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Results saving
+# ---------------------------------------------------------------------------
+
+def save_results(results, pruned_model, output_dir='results'):
+    """
+    Write all experiment outputs to output_dir/.
+    Overwrites existing files.  Creates the folder if absent.
+    """
+    import json
+    import os
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    from math import ceil
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    meta          = results.get('_meta', {})
+    n_epochs_half = meta.get('n_epochs_half', 50)
+    n_seeds       = meta.get('n_seeds', 1)
+    total_epochs  = n_epochs_half * 2
+    epochs        = list(range(total_epochs))
+
+    COLOURS = {
+        'frozen_transfer':        '#1f77b4',
+        'frozen_regrowth':        '#ff7f0e',
+        'unfrozen_transfer':      '#2ca02c',
+        'fc_baseline':            '#d62728',
+        'random_frozen':          '#9467bd',
+        'random_frozen_regrowth': '#8c564b',
+    }
+
+    # ── Compute summary stats ────────────────────────────────────────────────
+    means, stds, aucs, milestones, finals = {}, {}, {}, {}, {}
+    for v in _VARIANTS:
+        arr = np.array(results[v]['curves'])       # [n_seeds, total_epochs]
+        m   = arr.mean(axis=0)
+        s   = arr.std(axis=0)
+        means[v] = m
+        stds[v]  = s
+        aucs[v]  = round(float(np.trapezoid(m) / total_epochs), 4)
+        reach70  = int(np.argmax(m >= 0.70)) if (m >= 0.70).any() else None
+        reach80  = int(np.argmax(m >= 0.80)) if (m >= 0.80).any() else None
+        milestones[v] = {'70%': reach70, '80%': reach80}
+        finals[v] = {
+            'mean': round(float(arr[:, -1].mean()), 4),
+            'std':  round(float(arr[:, -1].std()),  4),
+        }
+
+    # ── learning_curves.html ────────────────────────────────────────────────
+    fig_lc = go.Figure()
+    for v in _VARIANTS:
+        m, s, col = means[v], stds[v], COLOURS[v]
+        # Confidence band
+        x_fill = epochs + epochs[::-1]
+        y_fill = (m + s).tolist() + (m - s).tolist()[::-1]
+        fig_lc.add_trace(go.Scatter(
+            x=x_fill, y=y_fill, fill='toself',
+            fillcolor=col, opacity=0.15,
+            line=dict(width=0), showlegend=False, hoverinfo='skip'))
+        # Mean line
+        fig_lc.add_trace(go.Scatter(
+            x=epochs, y=m.tolist(), name=v,
+            line=dict(color=col, width=2)))
+    # Split marker
+    fig_lc.add_vline(x=n_epochs_half - 0.5,
+                     line=dict(color='black', dash='dash', width=1),
+                     annotation_text='half split', annotation_position='top right')
+    fig_lc.update_layout(
+        title='Letter transfer — validation accuracy (mean ± std)',
+        xaxis_title='Epoch', yaxis_title='Val accuracy',
+        yaxis=dict(range=[0, 1]), template='plotly_white')
+    fig_lc.write_html(os.path.join(output_dir, 'learning_curves.html'))
+    print(f"  Saved learning_curves.html")
+
+    # ── auc ─────────────────────────────────────────────────────────────────
+    with open(os.path.join(output_dir, 'auc.json'), 'w') as f:
+        json.dump(aucs, f, indent=2)
+    with open(os.path.join(output_dir, 'auc.txt'), 'w') as f:
+        f.write("Area under learning curve (normalised by n_epochs)\n")
+        for v, a in aucs.items():
+            f.write(f"  {v:<30} {a:.4f}\n")
+    print(f"  Saved auc.json / auc.txt")
+
+    # ── milestone_epochs ────────────────────────────────────────────────────
+    with open(os.path.join(output_dir, 'milestone_epochs.json'), 'w') as f:
+        json.dump(milestones, f, indent=2)
+    with open(os.path.join(output_dir, 'milestone_epochs.txt'), 'w') as f:
+        f.write("First epoch reaching accuracy threshold (None = never reached)\n")
+        for v, ms in milestones.items():
+            f.write(f"  {v:<30}  70%: {ms['70%']}  80%: {ms['80%']}\n")
+    print(f"  Saved milestone_epochs.json / milestone_epochs.txt")
+
+    # ── final_accuracy ───────────────────────────────────────────────────────
+    with open(os.path.join(output_dir, 'final_accuracy.json'), 'w') as f:
+        json.dump(finals, f, indent=2)
+    with open(os.path.join(output_dir, 'final_accuracy.txt'), 'w') as f:
+        f.write("Final epoch accuracy (mean ± std across seeds)\n")
+        for v, fa in finals.items():
+            f.write(f"  {v:<30}  {fa['mean']:.4f} ± {fa['std']:.4f}\n")
+    print(f"  Saved final_accuracy.json / final_accuracy.txt")
+
+    # ── per_run_curves.json ─────────────────────────────────────────────────
+    raw = {v: results[v]['curves'] for v in _VARIANTS}
+    with open(os.path.join(output_dir, 'per_run_curves.json'), 'w') as f:
+        json.dump(raw, f)
+    print(f"  Saved per_run_curves.json")
+
+    # ── cluster_ablation.html ───────────────────────────────────────────────
+    regrowth_variants = ['frozen_regrowth', 'random_frozen_regrowth']
+    fig_ab = go.Figure()
+    for v in regrowth_variants:
+        ablation_runs = results[v]['ablation']
+        if not ablation_runs:
+            continue
+        all_cids = sorted({cid for run in ablation_runs for cid in run})
+        mean_drops = []
+        for cid in all_cids:
+            drops = [run.get(cid, 0.0) for run in ablation_runs]
+            mean_drops.append(float(np.mean(drops)))
+        fig_ab.add_trace(go.Bar(
+            name=v,
+            x=[f'C{c}' for c in all_cids],
+            y=mean_drops,
+            marker_color=COLOURS[v]))
+    fig_ab.update_layout(
+        barmode='group',
+        title='Mean letter-accuracy drop per cluster (ablation)',
+        xaxis_title='Cluster', yaxis_title='Mean accuracy drop',
+        template='plotly_white')
+    fig_ab.write_html(os.path.join(output_dir, 'cluster_ablation.html'))
+    print(f"  Saved cluster_ablation.html")
+
+    # ── summary.txt ─────────────────────────────────────────────────────────
+    lines = [
+        f"Experiment summary — {n_seeds} seed(s), {n_epochs_half} epochs/half",
+        f"{'='*60}",
+        "",
+        "Final accuracy (mean ± std):",
+    ]
+    for v, fa in finals.items():
+        lines.append(f"  {v:<30}  {fa['mean']:.4f} ± {fa['std']:.4f}")
+    lines += ["", "AUC (normalised):"]
+    for v, a in aucs.items():
+        lines.append(f"  {v:<30}  {a:.4f}")
+    lines += ["", "Milestone epochs (70% / 80%):"]
+    for v, ms in milestones.items():
+        lines.append(f"  {v:<30}  70%: {ms['70%']}  80%: {ms['80%']}")
+    lines += ["", "Cluster ablation (mean letter drop, regrowth variants):"]
+    for v in regrowth_variants:
+        ablation_runs = results[v]['ablation']
+        if not ablation_runs:
+            continue
+        all_cids = sorted({cid for run in ablation_runs for cid in run})
+        for cid in all_cids:
+            drops = [run.get(cid, 0.0) for run in ablation_runs]
+            lines.append(f"  {v} C{cid}: {float(np.mean(drops)):.4f}")
+    with open(os.path.join(output_dir, 'summary.txt'), 'w') as f:
+        f.write("\n".join(lines))
+    print(f"  Saved summary.txt")
+
+    # ── layer-0 weight heatmaps ──────────────────────────────────────────────
+    _save_layer0_heatmaps(pruned_model, output_dir)
+
+    print(f"\nAll results written to '{output_dir}/'")
+
+
+def _save_layer0_heatmaps(pruned_model, output_dir):
+    """
+    Save Plotly heatmaps of layer-0 neuron weight vectors (reshaped to 28×28).
+    Produces:
+        layer0_all_neurons.html  — full grid of all neurons
+        layer0_cluster_{id}.html — one grid per cluster (only neurons feeding that cluster)
+    """
+    import os
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    from math import ceil
+
+    lin_idx = _linear_indices(pruned_model)
+    cluster_map  = getattr(pruned_model, 'final_cluster_map',  None) or {}
+    layer_mapping = getattr(pruned_model, 'final_layer_mapping', None) or []
+
+    W0 = pruned_model.layer_stack[lin_idx[0]].weight.data.cpu().numpy()  # [h0, 784]
+    h0 = W0.shape[0]
+
+    def _make_grid_fig(neuron_indices, title):
+        n_cols = min(8, len(neuron_indices))
+        n_rows = ceil(len(neuron_indices) / n_cols) if n_cols > 0 else 1
+        fig = make_subplots(
+            rows=n_rows, cols=n_cols,
+            horizontal_spacing=0.01, vertical_spacing=0.01)
+        for pos, ni in enumerate(neuron_indices):
+            r, c = pos // n_cols + 1, pos % n_cols + 1
+            hm   = W0[ni].reshape(28, 28)
+            fig.add_trace(
+                go.Heatmap(z=hm.tolist(), colorscale='RdBu', zmid=0,
+                           showscale=False, name=f'n{ni}'),
+                row=r, col=c)
+        fig.update_layout(
+            title=title,
+            height=max(200, n_rows * 120),
+            template='plotly_white')
+        fig.update_xaxes(showticklabels=False)
+        fig.update_yaxes(showticklabels=False)
+        return fig
+
+    # Full grid
+    fig_all = _make_grid_fig(list(range(h0)), 'Layer-0 neuron weight maps (all)')
+    fig_all.write_html(os.path.join(output_dir, 'layer0_all_neurons.html'))
+    print(f"  Saved layer0_all_neurons.html  ({h0} neurons)")
+
+    # Per-cluster grids
+    if not cluster_map or not layer_mapping:
+        return
+
+    # Find h1 (size of layer_1 — first primitive layer)
+    h1 = pruned_model.layer_stack[lin_idx[1]].weight.shape[0]
+    W1 = pruned_model.layer_stack[lin_idx[1]].weight.data.cpu()  # [h1, h0]
+
+    for cid, global_neurons in sorted(cluster_map.items()):
+        # Neurons from this cluster that sit in layer_1 (global idx 0..h1-1)
+        l1_neurons = [gi for gi in global_neurons if gi < h1]
+        if not l1_neurons:
+            continue
+        # Layer-0 neurons with non-zero weight to at least one cluster-l1 neuron
+        feeds = (W1[l1_neurons, :].abs().sum(dim=0) > 0).nonzero(
+            as_tuple=True)[0].tolist()
+        if not feeds:
+            continue
+        fig_c = _make_grid_fig(feeds, f'Layer-0 neurons feeding cluster {cid}')
+        fig_c.write_html(os.path.join(output_dir, f'layer0_cluster_{cid}.html'))
+        print(f"  Saved layer0_cluster_{cid}.html  ({len(feeds)} neurons)")
+
+
+# ---------------------------------------------------------------------------
+# Cluster ablation intersection grid
+# ---------------------------------------------------------------------------
+
+def _get_images_by_class(loader, class_ids, n_samples=20):
+    """
+    Collect up to n_samples images per class from a DataLoader.
+
+    Args:
+        loader:     DataLoader yielding (images, labels)
+        class_ids:  iterable of class ids to collect (int or str)
+        n_samples:  max images per class
+
+    Returns:
+        dict {class_id: tensor [k, 1, 28, 28]}  (k ≤ n_samples)
+    """
+    class_ids = set(class_ids)
+    buckets = {c: [] for c in class_ids}
+    full = set()
+
+    for X, Y in loader:
+        if len(full) == len(class_ids):
+            break
+        for img, lbl in zip(X, Y):
+            key = lbl.item() if isinstance(lbl, torch.Tensor) else lbl
+            if key not in buckets:
+                continue
+            if len(buckets[key]) < n_samples:
+                buckets[key].append(img.cpu())
+            if len(buckets[key]) >= n_samples:
+                full.add(key)
+
+    return {c: torch.stack(imgs) for c, imgs in buckets.items() if imgs}
+
+
+def _intersection_image(images_by_class, class_ids, pixel_threshold=0.3):
+    """
+    Compute the intersection of stroke pixels across all sampled images for the
+    given class_ids.
+
+    Each image is binarized (pixel > pixel_threshold → 1.0), then the
+    element-wise minimum across all binarized images is taken, giving 1.0 only
+    where every image has a stroke pixel.
+
+    Args:
+        images_by_class:  dict {class_id: tensor [k, 1, 28, 28]}
+        class_ids:        which classes to include
+        pixel_threshold:  binarization threshold (default 0.3)
+
+    Returns:
+        np.ndarray [28, 28], values in {0, 1}
+    """
+    all_imgs = []
+    for c in class_ids:
+        if c in images_by_class:
+            all_imgs.append(images_by_class[c])  # [k, 1, 28, 28]
+
+    if not all_imgs:
+        return np.zeros((28, 28), dtype=np.float32)
+
+    pooled = torch.cat(all_imgs, dim=0)          # [N, 1, 28, 28]
+    binary = (pooled > pixel_threshold).float()  # binarize
+    binary = binary.squeeze(1)                   # [N, 28, 28]
+    intersection = binary.min(dim=0).values      # [28, 28] — 1 iff ALL images lit
+    return intersection.numpy()
+
+
+def _collect_activations_for_prototypes(model, loader, layer_mapping):
+    """
+    Collect all images and concatenated hidden-layer activations from a loader.
+
+    Mirrors the construction used in funcs.cluster_neurons_fabio: layer_0 is
+    excluded (it is the input projection, not a clustered hidden layer) and the
+    remaining hidden layers are concatenated in ascending index order to build
+    all_activations [N, total_neurons] whose columns match global neuron indices
+    defined by layer_mapping.
+
+    Returns:
+        images      tensor [N, 1, 28, 28]  (CPU)
+        all_acts    tensor [N, total_neurons]  (CPU)
+    """
+    all_images = []
+    for X, _ in loader:
+        all_images.append(X.cpu())
+    all_images = torch.cat(all_images, dim=0)
+
+    layer_data = model.get_layer_data(loader)
+    hidden = sorted(k for k in layer_data if k != 'layer_0')
+    all_acts = torch.cat(
+        [layer_data[ln]['post_activation'].cpu() for ln in hidden], dim=1
+    )
+    return all_images, all_acts
+
+
+def plot_cluster_ablation_grid(
+    letter_ablation, digit_ablation,
+    m_transfer, pruned_model,
+    cluster_map, layer_mapping,
+    letter_loader, digit_loader,
+    threshold=0.05, n_samples=20,
+    pixel_threshold=0.3, top_frac=0.1,
+    device=None,
+):
+    """
+    For each cluster plot a 4-row grid:
+
+      Row 0  Letter intersection  — common stroke pixels across significant-ablation letter classes
+      Row 1  Digit  intersection  — common stroke pixels across significant-ablation digit classes
+      Row 2  Letter prototype     — mean of top-activating letter images (m_transfer)
+      Row 3  Digit  prototype     — mean of top-activating digit  images (pruned_model)
+
+    Column title shows which letters/digits drove a significant ablation drop
+    (pre_acc - post_acc > threshold).
+
+    Args:
+        letter_ablation:  {cluster_id: {'pre': {letter_str: acc}, 'post': {letter_str: acc}}}
+        digit_ablation:   {cluster_id: {'pre': {int: acc},        'post': {int: acc}}}
+        m_transfer:       letter NeuralNetwork
+        pruned_model:     digit NeuralNetwork
+        cluster_map:      {cluster_id: [global_neuron_indices]}
+        layer_mapping:    [(layer_name, start, end), ...]
+        letter_loader:    DataLoader for letter val set
+        digit_loader:     DataLoader for digit  val set
+        threshold:        minimum accuracy drop considered significant (default 0.05)
+        n_samples:        images per class for intersection (default 20)
+        pixel_threshold:  binarization cutoff (default 0.3)
+        top_frac:         fraction of top-activating samples for prototype (default 0.1)
+    """
+    import matplotlib.pyplot as plt
+    import analysis
+    from itertools import chain
+
+    cluster_ids = sorted(cluster_map.keys())
+    n_clusters  = len(cluster_ids)
+    if n_clusters == 0:
+        print("plot_cluster_ablation_grid: cluster_map is empty.")
+        return
+
+    # ── significant classes per cluster ──────────────────────────────────────
+    def _sig(ablation_dict, cid):
+        if cid not in ablation_dict:
+            return []
+        pre  = ablation_dict[cid]['pre']
+        post = ablation_dict[cid]['post']
+        return [k for k in pre if pre[k] - post[k] > threshold]
+
+    sig_letters = {cid: _sig(letter_ablation, cid) for cid in cluster_ids}
+    sig_digits  = {cid: _sig(digit_ablation,  cid) for cid in cluster_ids}
+
+    # letter_ablation keys are strings ('a','b',...); loader yields integer labels (0-25).
+    # Convert to int indices for image collection; keep strings for display.
+    _letter_names = [chr(ord('a') + i) for i in range(26)]
+    sig_letters_int = {
+        cid: [_letter_names.index(c) for c in sl if c in _letter_names]
+        for cid, sl in sig_letters.items()
+    }
+
+    # ── collect images once (only the classes we actually need) ───────────────
+    all_letter_classes = set(chain.from_iterable(sig_letters_int.values()))
+    all_digit_classes  = set(chain.from_iterable(sig_digits.values()))
+
+    letter_imgs_by_cls = _get_images_by_class(letter_loader, all_letter_classes, n_samples)
+    digit_imgs_by_cls  = _get_images_by_class(digit_loader,  all_digit_classes,  n_samples)
+
+    # ── activation prototypes (one pass per model) ────────────────────────────
+    l_images, l_acts = _collect_activations_for_prototypes(m_transfer,  letter_loader, layer_mapping)
+    d_images, d_acts = _collect_activations_for_prototypes(pruned_model, digit_loader,  layer_mapping)
+
+    protos_letters = analysis.compute_prototypes_all_clusters(
+        cluster_map, l_acts, l_images, top_frac)
+    protos_digits  = analysis.compute_prototypes_all_clusters(
+        cluster_map, d_acts, d_images, top_frac)
+
+    # ── plot ──────────────────────────────────────────────────────────────────
+    row_labels = ['Letter\nintersection', 'Digit\nintersection',
+                  'Letter\nprototype',    'Digit\nprototype']
+
+    fig, axes = plt.subplots(4, n_clusters, figsize=(max(n_clusters * 2, 6), 9))
+    if n_clusters == 1:
+        axes = axes.reshape(4, 1)
+
+    for col, cid in enumerate(cluster_ids):
+        # Column title
+        sl = sig_letters[cid]
+        sd = [str(d) for d in sig_digits[cid]]
+        title = (f'Cluster {cid}\n'
+                 f'L: {",".join(sl) if sl else "—"}\n'
+                 f'D: {",".join(sd) if sd else "—"}')
+        axes[0, col].set_title(title, fontsize=8)
+
+        # Row 0 — letter intersection
+        img_l = _intersection_image(letter_imgs_by_cls, sig_letters_int[cid], pixel_threshold)
+        axes[0, col].imshow(img_l, cmap='gray', vmin=0, vmax=1)
+        axes[0, col].axis('off')
+
+        # Row 1 — digit intersection
+        img_d = _intersection_image(digit_imgs_by_cls, sig_digits[cid], pixel_threshold)
+        axes[1, col].imshow(img_d, cmap='gray', vmin=0, vmax=1)
+        axes[1, col].axis('off')
+
+        # Row 2 — letter prototype
+        proto_l = protos_letters.get(cid, {}).get('prototype', np.zeros((28, 28)))
+        axes[2, col].imshow(proto_l, cmap='viridis')
+        axes[2, col].axis('off')
+
+        # Row 3 — digit prototype
+        proto_d = protos_digits.get(cid, {}).get('prototype', np.zeros((28, 28)))
+        axes[3, col].imshow(proto_d, cmap='viridis')
+        axes[3, col].axis('off')
+
+        # Row labels on leftmost column only
+        if col == 0:
+            for row, lbl in enumerate(row_labels):
+                axes[row, 0].set_ylabel(lbl, fontsize=9)
+
+    plt.suptitle('Cluster ablation — intersection & activation prototypes', fontsize=11)
+    plt.tight_layout()
+    plt.show()

@@ -1,0 +1,44 @@
+Experiment summary — 3 seed(s), 10 epochs/half
+============================================================
+
+Final accuracy (mean ± std):
+  frozen_transfer                 0.7965 ± 0.0016
+  frozen_regrowth                 0.1100 ± 0.0000
+  unfrozen_transfer               0.8162 ± 0.0024
+  fc_baseline                     0.7705 ± 0.0044
+  random_frozen                   0.3102 ± 0.0662
+  random_frozen_regrowth          0.1355 ± 0.0180
+
+AUC (normalised):
+  frozen_transfer                 0.6605
+  frozen_regrowth                 0.4728
+  unfrozen_transfer               0.6832
+  fc_baseline                     0.5941
+  random_frozen                   0.2036
+  random_frozen_regrowth          0.1424
+
+Milestone epochs (70% / 80%):
+  frozen_transfer                 70%: 8  80%: None
+  frozen_regrowth                 70%: 8  80%: None
+  unfrozen_transfer               70%: 6  80%: 16
+  fc_baseline                     70%: 12  80%: None
+  random_frozen                   70%: None  80%: None
+  random_frozen_regrowth          70%: None  80%: None
+
+Cluster ablation (mean letter drop, regrowth variants):
+  frozen_regrowth C2: 0.0000
+  frozen_regrowth C4: 0.0000
+  frozen_regrowth C5: 0.0000
+  frozen_regrowth C6: 0.0000
+  frozen_regrowth C7: 0.0000
+  frozen_regrowth C8: 0.0000
+  frozen_regrowth C9: 0.0000
+  frozen_regrowth C10: 0.0000
+  random_frozen_regrowth C2: 0.0000
+  random_frozen_regrowth C4: 0.0000
+  random_frozen_regrowth C5: 0.0000
+  random_frozen_regrowth C6: 0.0000
+  random_frozen_regrowth C7: 0.0000
+  random_frozen_regrowth C8: 0.0000
+  random_frozen_regrowth C9: 0.0000
+  random_frozen_regrowth C10: 0.0000

@@ -327,3 +327,73 @@ def compute_cluster_digit_consensus(cluster_digit_counts, images, labels,
         }
 
     return result
+
+
+def compute_cluster_class_prototypes(cluster_map, all_neuron_activations, images, labels,
+                                      ablation_results, top_frac=0.1):
+    """
+    For each cluster, find the digit it is most critical for (largest accuracy drop in
+    ablation_results), then compute:
+
+      - class_proto : average of the top-k images of that digit ranked by cluster activation
+                      → the prototypical instance of the critical digit this cluster fires on
+      - class_diff  : class_proto minus the mean of ALL images of that digit
+                      → which pixels of that digit are unique to cluster-preferred instances
+
+    Args:
+        cluster_map:           {cluster_id: [global_neuron_indices]}
+        all_neuron_activations: tensor [N, total_neurons]
+        images:                tensor [N, 1, 28, 28]
+        labels:                tensor [N] integer class labels
+        ablation_results:      {cluster_id: {'pre': {cls: acc}, 'post': {cls: acc}}}
+        top_frac:              fraction of per-digit images to average (default 0.1)
+
+    Returns:
+        dict: {cluster_id: {'class_proto': np.ndarray [28,28],
+                             'class_diff':  np.ndarray [28,28],
+                             'top_digit':   int}}
+    """
+    def _norm(t):
+        mn, mx = t.min(), t.max()
+        return (t - mn) / (mx - mn + 1e-8)
+
+    result = {}
+
+    for cid, cluster_indices in cluster_map.items():
+        # ── find top digit from ablation ──────────────────────────────────────
+        if cid not in ablation_results:
+            continue
+        pre  = ablation_results[cid]['pre']
+        post = ablation_results[cid]['post']
+        drops = {d: pre[d] - post[d] for d in pre}
+        top_digit = max(drops, key=drops.get)
+
+        # ── filter to that digit ──────────────────────────────────────────────
+        digit_mask = (labels == top_digit)
+        if digit_mask.sum() == 0:
+            continue
+        digit_imgs = images[digit_mask]          # [M, 1, 28, 28]
+        digit_acts = all_neuron_activations[digit_mask][:, cluster_indices]  # [M, k]
+
+        # ── top-k of that digit by cluster activation ─────────────────────────
+        strength = digit_acts.mean(dim=1)        # [M]
+        k = max(1, int(top_frac * len(strength)))
+        _, top_idx = torch.topk(strength, k)
+
+        class_proto = digit_imgs[top_idx].mean(dim=0).squeeze()  # [28, 28]
+        class_proto = _norm(class_proto).cpu().numpy()
+
+        # ── diff: class_proto minus mean of all images of that digit ──────────
+        digit_mean = digit_imgs.float().mean(dim=0).squeeze()
+        digit_mean = _norm(digit_mean).cpu().numpy()
+
+        raw_diff = class_proto - digit_mean
+        class_diff = (raw_diff - raw_diff.min()) / (raw_diff.max() - raw_diff.min() + 1e-8)
+
+        result[cid] = {
+            'class_proto': class_proto,
+            'class_diff':  class_diff,
+            'top_digit':   int(top_digit),
+        }
+
+    return result

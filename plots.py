@@ -66,6 +66,46 @@ def plot_first_layer_weights(model, layer_data=None, sort_by='weight_norm', top_
     plt.show()
 
 
+def plot_layer0_receptive_fields(model, n_cols=8):
+    """
+    Display every neuron in layer 0 as a 28×28 weight map.
+
+    Colour scheme centred at zero:
+      black  = negative weight  (input pixel suppresses this neuron)
+      white  = zero weight      (input pixel has no effect)
+      blue   = positive weight  (input pixel excites this neuron)
+
+    Args:
+        model:  NeuralNetwork instance (any model, any architecture)
+        n_cols: columns in the grid (default 8)
+    """
+    import torch
+    from matplotlib.colors import LinearSegmentedColormap
+
+    cmap = LinearSegmentedColormap.from_list('bwblue', ['black', 'white', 'blue'])
+
+    first_linear = next(l for l in model.layer_stack if isinstance(l, torch.nn.Linear))
+    W = first_linear.weight.data.cpu().numpy()  # [n_neurons, 784]
+    n_neurons = W.shape[0]
+
+    n_rows = (n_neurons + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 1.8, n_rows * 1.8))
+    axes = np.array(axes).flatten()
+
+    vmax = np.abs(W).max()
+
+    for i, ax in enumerate(axes):
+        if i < n_neurons:
+            w = W[i].reshape(28, 28)
+            ax.imshow(w, cmap=cmap, vmin=-vmax, vmax=vmax)
+            ax.set_title(f'n{i}', fontsize=6)
+        ax.axis('off')
+
+    plt.suptitle(f'Layer-0 receptive fields ({n_neurons} neurons)', fontsize=12)
+    plt.tight_layout()
+    plt.show()
+
+
 def plot_cluster_accuracy_bars(cluster_results, target_labels=None, n_cols=4, figsize_per_plot=(4,3)):
     """
     Plots per-cluster pre- vs post-ablation accuracy as bars per class.
@@ -158,21 +198,22 @@ def plot_loss(metrics):
     plt.show()
 
 def plot_cluster_prototypes_and_diff_all(all_prototypes, model, cluster_map, layer_mapping,
-                                          consensus_maps=None):
+                                          class_proto_maps=None):
     """
-    Plot prototypes, difference maps, activation maximization, and (optionally) consensus
-    pixel maps for all clusters.
+    Plot prototypes, difference maps, and (optionally) class-conditioned prototype +
+    class diff map for all clusters.
 
     Args:
-        all_prototypes: dict {cluster_id: {'prototype': 28x28 array, 'diff_map': 28x28 array}}
-        model:          NeuralNetwork instance
-        cluster_map:    {cluster_id: [global_neuron_indices]}
-        layer_mapping:  [(layer_name, start_idx, end_idx), ...]
-        consensus_maps: optional dict from compute_cluster_consensus_pixels — if provided,
-                        adds a 4th row showing shared pixel features per cluster.
+        all_prototypes:   dict {cluster_id: {'prototype': 28x28, 'diff_map': 28x28}}
+        model:            NeuralNetwork instance (unused when class_proto_maps provided)
+        cluster_map:      {cluster_id: [global_neuron_indices]}
+        layer_mapping:    [(layer_name, start_idx, end_idx), ...]
+        class_proto_maps: optional dict from compute_cluster_class_prototypes — if provided,
+                          replaces activation-max + consensus rows with class-conditioned
+                          prototype and class diff map.
     """
     n_clusters = len(all_prototypes)
-    n_rows = 4 if consensus_maps is not None else 3
+    n_rows = 4 if class_proto_maps is not None else 3
     fig, axes = plt.subplots(n_rows, n_clusters, figsize=(n_clusters*2, n_rows*2))
     if n_clusters == 1:
         axes = axes.reshape(n_rows, 1)
@@ -181,43 +222,49 @@ def plot_cluster_prototypes_and_diff_all(all_prototypes, model, cluster_map, lay
         proto = all_prototypes[cluster_id]['prototype']
         diff  = all_prototypes[cluster_id]['diff_map']
 
-        ax_top = axes[0, i]
-        ax_top.imshow(proto, cmap='viridis')
-        ax_top.axis('off')
-        ax_top.set_title(f'Cluster {cluster_id}', fontsize=10)
-        if i == 0:
-            ax_top.set_ylabel('Prototype', fontsize=10)
+        # Column title — add top digit if available
+        title = f'Cluster {cluster_id}'
+        if class_proto_maps is not None and cluster_id in class_proto_maps:
+            title += f"\ntop:{class_proto_maps[cluster_id]['top_digit']}"
+        axes[0, i].set_title(title, fontsize=9)
 
-        ax_diff = axes[1, i]
-        ax_diff.imshow(diff, cmap='viridis')
-        ax_diff.axis('off')
+        axes[0, i].imshow(proto, cmap='viridis')
+        axes[0, i].axis('off')
         if i == 0:
-            ax_diff.set_ylabel('Diff Map', fontsize=10)
+            axes[0, i].set_ylabel('Prototype', fontsize=10)
 
-    # Row 3 — activation maximization
-    for i, cluster_id in enumerate(sorted(all_prototypes.keys())):
-        act_max = am.visualize_cluster(model, cluster_map, layer_mapping, cluster_id, show=False)
-        ax_act = axes[2, i]
-        ax_act.imshow(act_max, cmap='gray')
-        ax_act.axis('off')
+        axes[1, i].imshow(diff, cmap='viridis')
+        axes[1, i].axis('off')
         if i == 0:
-            ax_act.set_ylabel('Activation Max', fontsize=10)
+            axes[1, i].set_ylabel('Diff Map', fontsize=10)
 
-    # Row 4 — consensus pixel map (optional)
-    if consensus_maps is not None:
+    if class_proto_maps is not None:
+        # Row 3 — class-conditioned prototype (clean single-digit image)
         for i, cluster_id in enumerate(sorted(all_prototypes.keys())):
-            ax_con = axes[3, i]
-            if cluster_id in consensus_maps:
-                ax_con.imshow(consensus_maps[cluster_id]['consensus'], cmap='gray_r')
-            else:
-                ax_con.imshow(np.zeros((28, 28)), cmap='gray_r')
-            ax_con.axis('off')
-            if i == 0:
-                ax_con.set_ylabel('Digit\nConsensus', fontsize=10)
+            img = class_proto_maps.get(cluster_id, {}).get('class_proto', np.zeros((28, 28)))
+            axes[2, i].imshow(img, cmap='gray_r')
+            axes[2, i].axis('off')
+        if n_clusters > 0:
+            axes[2, 0].set_ylabel('Class\nProto', fontsize=10)
 
-    title = 'All Clusters — Prototypes, Diff Maps, Activation Max'
-    if consensus_maps is not None:
-        title += ', Consensus Pixels'
+        # Row 4 — class diff map (which pixels of that digit the cluster prefers)
+        for i, cluster_id in enumerate(sorted(all_prototypes.keys())):
+            img = class_proto_maps.get(cluster_id, {}).get('class_diff', np.zeros((28, 28)))
+            axes[3, i].imshow(img, cmap='RdBu_r')
+            axes[3, i].axis('off')
+        if n_clusters > 0:
+            axes[3, 0].set_ylabel('Class\nDiff', fontsize=10)
+    else:
+        # Row 3 — activation maximization (legacy fallback)
+        for i, cluster_id in enumerate(sorted(all_prototypes.keys())):
+            act_max = am.visualize_cluster(model, cluster_map, layer_mapping, cluster_id, show=False)
+            axes[2, i].imshow(act_max, cmap='gray')
+            axes[2, i].axis('off')
+        if n_clusters > 0:
+            axes[2, 0].set_ylabel('Activation Max', fontsize=10)
+
+    title = 'All Clusters — Prototypes, Diff Maps'
+    title += (', Class Proto & Diff' if class_proto_maps is not None else ', Activation Max')
     plt.suptitle(title, fontsize=12)
     plt.tight_layout()
     plt.show()
