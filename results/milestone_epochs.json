@@ -1,19 +1,19 @@
 {
   "frozen_transfer": {
     "70%": 8,
-    "80%": null
+    "80%": 21
   },
   "frozen_regrowth": {
     "70%": 8,
-    "80%": null
+    "80%": 21
   },
   "unfrozen_transfer": {
     "70%": 6,
-    "80%": 16
+    "80%": 15
   },
   "fc_baseline": {
-    "70%": 12,
-    "80%": null
+    "70%": 11,
+    "80%": 26
   },
   "random_frozen": {
     "70%": null,

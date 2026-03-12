@@ -20,7 +20,7 @@ def cluster_criticality_per_class(model, cluster_indices, layer_mapping, data_lo
     # Get all labels
     all_labels = []
     for _, y in data_loader:
-        all_labels.append(y)
+        all_labels.append(y if isinstance(y, torch.Tensor) else torch.tensor([y]))
     all_labels = torch.cat(all_labels).to(device)
 
     print(f"\n--- Calculating pre and post-ablation accuracy for cluster {cluster_id} ---")

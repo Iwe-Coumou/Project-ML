@@ -1,26 +1,26 @@
 {
   "frozen_transfer": {
-    "mean": 0.7965,
-    "std": 0.0016
+    "mean": 0.8703,
+    "std": 0.0025
   },
   "frozen_regrowth": {
-    "mean": 0.11,
-    "std": 0.0
+    "mean": 0.7699,
+    "std": 0.022
   },
   "unfrozen_transfer": {
-    "mean": 0.8162,
-    "std": 0.0024
+    "mean": 0.8767,
+    "std": 0.0022
   },
   "fc_baseline": {
-    "mean": 0.7705,
-    "std": 0.0044
+    "mean": 0.8776,
+    "std": 0.003
   },
   "random_frozen": {
-    "mean": 0.3102,
-    "std": 0.0662
+    "mean": 0.6484,
+    "std": 0.0226
   },
   "random_frozen_regrowth": {
-    "mean": 0.1355,
-    "std": 0.018
+    "mean": 0.1177,
+    "std": 0.0153
   }
 }

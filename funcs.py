@@ -787,15 +787,16 @@ def error_driven_regrowth(model, cluster_map, layer_mapping, val_loader,
 
         for spawn_i in range(n_spawn):
             new_row = _expo_sparse(allowed_in, in_features)
-            new_col = _expo_sparse(allowed_out, out_features_next)
+            # Zero-initialize downstream connections: new neurons start silent and
+            # learn their output weights from scratch rather than disrupting the
+            # output layer with large random initial signals.
+            new_col = torch.zeros(out_features_next, device=dev)
 
             n_in     = int((new_row != 0).sum().item())
-            n_out    = int((new_col != 0).sum().item())
             mean_in  = new_row[new_row != 0].abs().mean().item() if n_in  > 0 else 0.0
-            mean_out = new_col[new_col != 0].abs().mean().item() if n_out > 0 else 0.0
             print(f"    [{spawn_i + 1}/{n_spawn}] spawned in {target_lname}: "
                   f"{n_in} in-connections (mean |w|={mean_in:.4f}), "
-                  f"{n_out} out-connections (mean |w|={mean_out:.4f})")
+                  f"out-connections initialised to zero")
 
             layer.weight.data  = torch.cat([layer.weight.data, new_row.unsqueeze(0)], dim=0)
             layer.bias.data    = torch.cat([layer.bias.data, torch.zeros(1, device=dev)], dim=0)
@@ -827,6 +828,14 @@ def error_driven_regrowth(model, cluster_map, layer_mapping, val_loader,
                     break
 
             n_added += 1
+
+    # Update layer_mapping in-place so subsequent ablation calls see the correct
+    # layer sizes. Without this, neurons added above are invisible to
+    # _measure_cluster_ablation (their global indices fall outside the stale 'end'),
+    # causing all drops to appear zero and blocking further regrowth.
+    for i, (lname2, start2, end2) in enumerate(layer_mapping):
+        if layer_added[lname2] > 0:
+            layer_mapping[i] = (lname2, start2, end2 + layer_added[lname2])
 
     return n_added
 

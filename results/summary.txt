@@ -1,39 +1,39 @@
-Experiment summary — 3 seed(s), 10 epochs/half
+Experiment summary — 5 seed(s), 50 epochs/half
 ============================================================
 
 Final accuracy (mean ± std):
-  frozen_transfer                 0.7965 ± 0.0016
-  frozen_regrowth                 0.1100 ± 0.0000
-  unfrozen_transfer               0.8162 ± 0.0024
-  fc_baseline                     0.7705 ± 0.0044
-  random_frozen                   0.3102 ± 0.0662
-  random_frozen_regrowth          0.1355 ± 0.0180
+  frozen_transfer                 0.8703 ± 0.0025
+  frozen_regrowth                 0.7699 ± 0.0220
+  unfrozen_transfer               0.8767 ± 0.0022
+  fc_baseline                     0.8776 ± 0.0030
+  random_frozen                   0.6484 ± 0.0226
+  random_frozen_regrowth          0.1177 ± 0.0153
 
 AUC (normalised):
-  frozen_transfer                 0.6605
-  frozen_regrowth                 0.4728
-  unfrozen_transfer               0.6832
-  fc_baseline                     0.5941
-  random_frozen                   0.2036
-  random_frozen_regrowth          0.1424
+  frozen_transfer                 0.8108
+  frozen_regrowth                 0.5979
+  unfrozen_transfer               0.8260
+  fc_baseline                     0.7984
+  random_frozen                   0.4693
+  random_frozen_regrowth          0.2216
 
 Milestone epochs (70% / 80%):
-  frozen_transfer                 70%: 8  80%: None
-  frozen_regrowth                 70%: 8  80%: None
-  unfrozen_transfer               70%: 6  80%: 16
-  fc_baseline                     70%: 12  80%: None
+  frozen_transfer                 70%: 8  80%: 21
+  frozen_regrowth                 70%: 8  80%: 21
+  unfrozen_transfer               70%: 6  80%: 15
+  fc_baseline                     70%: 11  80%: 26
   random_frozen                   70%: None  80%: None
   random_frozen_regrowth          70%: None  80%: None
 
 Cluster ablation (mean letter drop, regrowth variants):
-  frozen_regrowth C2: 0.0000
-  frozen_regrowth C4: 0.0000
-  frozen_regrowth C5: 0.0000
-  frozen_regrowth C6: 0.0000
-  frozen_regrowth C7: 0.0000
-  frozen_regrowth C8: 0.0000
-  frozen_regrowth C9: 0.0000
-  frozen_regrowth C10: 0.0000
+  frozen_regrowth C2: 0.2257
+  frozen_regrowth C4: 0.3043
+  frozen_regrowth C5: 0.3210
+  frozen_regrowth C6: 0.2247
+  frozen_regrowth C7: 0.2963
+  frozen_regrowth C8: 0.1710
+  frozen_regrowth C9: 0.2502
+  frozen_regrowth C10: 0.2612
   random_frozen_regrowth C2: 0.0000
   random_frozen_regrowth C4: 0.0000
   random_frozen_regrowth C5: 0.0000
@@ -42,3 +42,14 @@ Cluster ablation (mean letter drop, regrowth variants):
   random_frozen_regrowth C8: 0.0000
   random_frozen_regrowth C9: 0.0000
   random_frozen_regrowth C10: 0.0000
+
+Test-set accuracy (mean ± std):
+  frozen_transfer                 0.8657 ± 0.0025
+  frozen_regrowth                 0.7618 ± 0.0227
+  unfrozen_transfer               0.8739 ± 0.0026
+  fc_baseline                     0.8734 ± 0.0029
+  random_frozen                   0.6397 ± 0.0225
+  random_frozen_regrowth          0.1179 ± 0.0167
+
+NOTE — collapsed variants (final acc < 0.15, near chance):
+  random_frozen_regrowth: final val acc = 0.1177. Hypothesis: stale layer_mapping after regrowth corrupts ablation measurement on the second regrowth call, causing mode collapse. Framed as a negative result / future work.

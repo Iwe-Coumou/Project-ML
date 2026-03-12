@@ -35,12 +35,16 @@ def _tprint(*args, **kwargs):
 # Data loading
 # ---------------------------------------------------------------------------
 
-def get_letters_dataloaders(batch_size=8000, val_frac=0.1):
+def get_letters_dataloaders(batch_size=8000, val_frac=0.1, train_frac=1.0):
     """
     Load EMNIST 'byclass' split filtered to lowercase a-z (classes 36-61 → remapped to 0-25).
 
     Applies the same rotate-then-flip transform used for the digit dataset so
     the pixel orientation is consistent.
+
+    Args:
+        train_frac: fraction of the training split to keep (default 1.0 = full set).
+                    Subsampling uses a fixed seed so results are reproducible.
 
     Returns:
         (train_loader, val_loader, test_loader)
@@ -78,6 +82,12 @@ def get_letters_dataloaders(batch_size=8000, val_frac=0.1):
     train_dataset, val_dataset = random_split(
         train_full, [n_train, n_val],
         generator=torch.Generator().manual_seed(42))
+
+    if train_frac < 1.0:
+        n_sub = max(26 * 10, int(train_frac * n_train))  # at least 260 samples
+        sub_idx = torch.randperm(n_train, generator=torch.Generator().manual_seed(0))[:n_sub]
+        train_dataset = Subset(train_dataset, sub_idx.tolist())
+        n_train = n_sub
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size)
@@ -687,7 +697,7 @@ def _run_variant_full(name, model, h1_ds, h2_ds, val_ds, batch_size,
 
 def run_experiment(pruned_model, n_seeds=5, n_epochs_half=50, lr=1e-3,
                    batch_size=4096, threshold_frac=1.5, n_spawn=5,
-                   regrowth_interval=5, device=None):
+                   regrowth_interval=5, device=None, train_frac=1.0):
     """
     Run six transfer-learning variants on EMNIST letters with multiple seeds,
     training all six variants in parallel within each seed.
@@ -729,11 +739,12 @@ def run_experiment(pruned_model, n_seeds=5, n_epochs_half=50, lr=1e-3,
     layer_mapping    = getattr(pruned_model, 'final_layer_mapping', None) or []
     criterion        = nn.CrossEntropyLoss()
 
-    results = {v: {'curves': [], 'ablation': []} for v in _VARIANTS}
+    results = {v: {'curves': [], 'ablation': [], 'test_acc_per_seed': []} for v in _VARIANTS}
     results['_meta'] = {
         'n_epochs_half': n_epochs_half,
         'n_seeds': n_seeds,
         'regrowth_interval': regrowth_interval,
+        'train_frac': train_frac,
     }
 
     # Pre-load all data into CPU tensors once.
@@ -741,7 +752,7 @@ def run_experiment(pruned_model, n_seeds=5, n_epochs_half=50, lr=1e-3,
     # DataLoader iteration.  Loading here applies them once and stores raw float tensors,
     # so per-thread DataLoaders use TensorDataset whose __getitem__ is a pure C++ tensor
     # slice — zero Python/PIL overhead, no GIL contention on data loading.
-    train_loader_base, val_loader_base, _ = get_letters_dataloaders(batch_size=batch_size)
+    train_loader_base, val_loader_base, test_loader_base = get_letters_dataloaders(batch_size=batch_size, train_frac=train_frac)
     train_dataset = train_loader_base.dataset   # Subset from random_split(seed=42)
     val_ds        = val_loader_base.dataset
 
@@ -750,6 +761,7 @@ def run_experiment(pruned_model, n_seeds=5, n_epochs_half=50, lr=1e-3,
     val_X,   val_y   = _preload_to_tensors(val_ds,        batch_size=batch_size)
     val_ds_tensor    = TensorDataset(val_X, val_y)
     _tprint(f"  train: {train_X.shape}  val: {val_X.shape}")
+    results['_meta']['n_train'] = train_X.shape[0]
 
     for seed in range(n_seeds):
         _tprint(f"\n{'='*60}\nSEED {seed}\n{'='*60}")
@@ -819,6 +831,27 @@ def run_experiment(pruned_model, n_seeds=5, n_epochs_half=50, lr=1e-3,
         for name in _VARIANTS:
             results[name]['curves'].append(seed_curves[name])
 
+        if test_loader_base is not None:
+            _tprint("\n-- Test set evaluation --")
+            for name, m in [
+                ('frozen_transfer',         m_ft),
+                ('frozen_regrowth',         m_fr),
+                ('unfrozen_transfer',       m_uf),
+                ('fc_baseline',             m_fc),
+                ('random_frozen',           m_rf),
+                ('random_frozen_regrowth',  m_rfr),
+            ]:
+                m.eval()
+                correct = total = 0
+                with torch.no_grad():
+                    for xb, yb in test_loader_base:
+                        xb, yb = xb.to(device), yb.to(device)
+                        correct += (m(xb).argmax(1) == yb).sum().item()
+                        total += yb.size(0)
+                acc = correct / total
+                results[name]['test_acc_per_seed'].append(acc)
+                _tprint(f"  {name:<30} test acc: {acc:.4f}")
+
         # ── Ablation (regrowth variants only) — run after training ───────────
         _tprint("\n-- Ablation --")
         ablation_val_loader = DataLoader(val_ds_tensor, batch_size=batch_size, shuffle=False, num_workers=0)
@@ -887,6 +920,16 @@ def save_results(results, pruned_model, output_dir='results'):
             'mean': round(float(arr[:, -1].mean()), 4),
             'std':  round(float(arr[:, -1].std()),  4),
         }
+    
+    # test accuracy (if available from run_experiment)
+    test_finals = {}
+    for v in _VARIANTS:
+        per_seed = results[v].get("test_acc_per_seed", [])
+        if per_seed:
+            test_finals[v] = {
+                'mean': round(float(np.mean(per_seed)), 4),
+                'std': round(float(np.std(per_seed)), 4),
+            }
 
     # ── learning_curves.html ────────────────────────────────────────────────
     fig_lc = go.Figure()
@@ -940,6 +983,16 @@ def save_results(results, pruned_model, output_dir='results'):
         for v, fa in finals.items():
             f.write(f"  {v:<30}  {fa['mean']:.4f} ± {fa['std']:.4f}\n")
     print(f"  Saved final_accuracy.json / final_accuracy.txt")
+
+    # ── test_accuracy ───────────────────────────────────────────────────────
+    if test_finals:
+        with open(os.path.join(output_dir, 'test_accuracy.json'), 'w') as f:
+            json.dump(test_finals, f, indent=2)
+        with open(os.path.join(output_dir, 'test_accuracy.txt'), 'w') as f:
+            f.write("Final test-set accuracy (mean ± std across seeds)\n")
+            for v, fa in test_finals.items():
+                f.write(f"  {v:<30}  {fa['mean']:.4f} ± {fa['std']:.4f}\n")
+        print(f"    Saved test_accuracy.txt")
 
     # ── per_run_curves.json ─────────────────────────────────────────────────
     raw = {v: results[v]['curves'] for v in _VARIANTS}
@@ -995,7 +1048,22 @@ def save_results(results, pruned_model, output_dir='results'):
         all_cids = sorted({cid for run in ablation_runs for cid in run})
         for cid in all_cids:
             drops = [run.get(cid, 0.0) for run in ablation_runs]
-            lines.append(f"  {v} C{cid}: {float(np.mean(drops)):.4f}")
+            lines.append(f"  {v} C{cid}: {float(np.mean(drops)):.4f}")      
+    if test_finals:
+        lines += ["", "Test-set accuracy (mean ± std):"]
+        for v, fa in test_finals.items():
+            lines.append(f"  {v:<30}  {fa['mean']:.4f} ± {fa['std']:.4f}")
+    # Collapse detection
+    collapse_variants = [v for v in _VARIANTS
+                         if finals[v]['mean'] < 0.15]
+    if collapse_variants:
+        lines += ["", "NOTE — collapsed variants (final acc < 0.15, near chance):"]
+        for v in collapse_variants:
+            lines.append(f"  {v}: final val acc = {finals[v]['mean']:.4f}. "
+                         f"Hypothesis: stale layer_mapping after regrowth corrupts "
+                         f"ablation measurement on the second regrowth call, causing "
+                         f"mode collapse. Framed as a negative result / future work.")
+    
     with open(os.path.join(output_dir, 'summary.txt'), 'w') as f:
         f.write("\n".join(lines))
     print(f"  Saved summary.txt")
@@ -1004,6 +1072,117 @@ def save_results(results, pruned_model, output_dir='results'):
     _save_layer0_heatmaps(pruned_model, output_dir)
 
     print(f"\nAll results written to '{output_dir}/'")
+
+def run_significance_tests(results):
+    """
+    Welch's t-test between key variant pairs using per-seed test accuracies.
+    Returns dict of {pair_label: {'t': float, 'p': float, 'n': int}}.
+    Requires test_loader to have been passed to run_experiment().
+    """
+    from scipy import stats
+
+    pairs = [
+        ('unfrozen_transfer', 'fc_baseline',   'unfrozen_transfer vs fc_baseline'),
+        ('frozen_transfer',   'fc_baseline',   'frozen_transfer vs fc_baseline'),
+        ('frozen_transfer',   'random_frozen', 'frozen_transfer vs random_frozen'),
+    ]
+    out = {}
+    for a, b, label in pairs:
+        accs_a = results[a].get('test_acc_per_seed', [])
+        accs_b = results[b].get('test_acc_per_seed', [])
+        if len(accs_a) < 2 or len(accs_b) < 2:
+            out[label] = {'error': 'not enough seeds for t-test'}
+            continue
+        t, p = stats.ttest_ind(accs_a, accs_b, equal_var=False)
+        out[label] = {'t': round(float(t), 4), 'p': round(float(p), 4), 'n': len(accs_a)}
+    return out
+
+
+def plot_final_comparison(results, sig_tests=None, output_dir='results'):
+    """
+    Static matplotlib bar chart: final test accuracy per variant with ± std error bars.
+    """
+    import matplotlib.pyplot as plt
+    import os
+
+    variants = _VARIANTS
+    means, stds = [], []
+    for v in variants:
+        per_seed = results[v].get('test_acc_per_seed', [])
+        if per_seed:
+            means.append(float(np.mean(per_seed)))
+            stds.append(float(np.std(per_seed)))
+        else:
+            fa = results[v].get('curves', [[]])
+            last = [c[-1] for c in fa if c]
+            means.append(float(np.mean(last)) if last else 0.0)
+            stds.append(float(np.std(last))  if last else 0.0)
+
+    colours = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b']
+    x = np.arange(len(variants))
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    bars = ax.bar(x, means, yerr=stds, capsize=5, color=colours, alpha=0.85,
+                  error_kw=dict(elinewidth=1.5, ecolor='black'))
+    ax.set_xticks(x)
+    ax.set_xticklabels([v.replace('_', '\n') for v in variants], fontsize=9)
+    ax.set_ylabel('Test Accuracy')
+    ax.set_ylim(0, 1)
+    ax.set_title(f'Transfer Learning Variants — Final Test Accuracy'
+                 f' (mean ± std, n={len(results[variants[0]].get("test_acc_per_seed", [1]))} seeds)')
+    ax.axhline(1/26, color='grey', linestyle='--', linewidth=0.8, label='chance (1/26)')
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, 'final_comparison.png')
+    fig.savefig(path, dpi=150)
+    plt.show()
+    print(f"  Saved {path}")
+
+def plot_learning_curves_static(results, output_dir='results'):
+    """
+    Static matplotlib learning curves with ± std shaded bands.
+    """
+    import matplotlib.pyplot as plt
+    import os
+
+    meta          = results.get('_meta', {})
+    n_epochs_half = meta.get('n_epochs_half', 10)
+    total_epochs  = n_epochs_half * 2
+    epochs        = np.arange(total_epochs)
+
+    colours = {
+        'frozen_transfer':        '#1f77b4',
+        'frozen_regrowth':        '#ff7f0e',
+        'unfrozen_transfer':      '#2ca02c',
+        'fc_baseline':            '#d62728',
+        'random_frozen':          '#9467bd',
+        'random_frozen_regrowth': '#8c564b',
+    }
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for v in _VARIANTS:
+        arr = np.array(results[v]['curves'])   # [n_seeds, total_epochs]
+        m, s = arr.mean(0), arr.std(0)
+        col = colours[v]
+        ax.plot(epochs, m, label=v, color=col, linewidth=2)
+        ax.fill_between(epochs, m - s, m + s, alpha=0.15, color=col)
+
+    ax.axvline(n_epochs_half - 0.5, color='black', linestyle='--',
+               linewidth=0.8, label='half split')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Validation Accuracy')
+    ax.set_ylim(0, 1)
+    ax.set_title('Letter Transfer — Validation Accuracy (mean ± std)')
+    ax.legend(fontsize=8, loc='lower right')
+    plt.tight_layout()
+
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, 'learning_curves.png')
+    fig.savefig(path, dpi=150)
+    plt.show()
+    print(f"  Saved {path}")
 
 
 def _save_layer0_heatmaps(pruned_model, output_dir):
@@ -1292,3 +1471,241 @@ def plot_cluster_ablation_grid(
     plt.suptitle('Cluster ablation — intersection & activation prototypes', fontsize=11)
     plt.tight_layout()
     plt.show()
+
+
+# ---------------------------------------------------------------------------
+# Epoch-level significance — crossover analysis
+# ---------------------------------------------------------------------------
+
+def plot_epoch_significance(results, pairs=None, output_dir='results'):
+    """
+    Show when transfer learning stops being better than the FC baseline.
+
+    For each pair of variants, computes at every epoch:
+      - mean accuracy per variant (± std over seeds)
+      - Welch's t-test p-value between the two variants
+
+    Two-panel figure per pair:
+      Top   — accuracy curves with ± std shading
+      Bottom — per-epoch p-value (log scale); p=0.05 line; crossover epochs marked
+
+    Crossover epochs reported:
+      - Performance crossover: first epoch where variant A mean < variant B mean
+      - Significance crossover: last epoch where p < 0.05 with A still ahead
+
+    Args:
+        results:    output of run_experiment()
+        pairs:      list of (variant_a, variant_b, label) tuples.
+                    Default: the two key comparisons against fc_baseline.
+        output_dir: where to save the PNG
+    """
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from scipy.stats import ttest_ind
+
+    if pairs is None:
+        pairs = [
+            ('unfrozen_transfer', 'fc_baseline', 'unfrozen_transfer vs fc_baseline'),
+            ('frozen_transfer',   'fc_baseline', 'frozen_transfer vs fc_baseline'),
+        ]
+
+    colours = {
+        'frozen_transfer':        '#1f77b4',
+        'unfrozen_transfer':      '#2ca02c',
+        'fc_baseline':            '#d62728',
+        'random_frozen':          '#9467bd',
+        'frozen_regrowth':        '#ff7f0e',
+        'random_frozen_regrowth': '#8c564b',
+    }
+
+    n_pairs = len(pairs)
+    fig, axes = plt.subplots(2, n_pairs, figsize=(7 * n_pairs, 8),
+                             gridspec_kw={'height_ratios': [2, 1]})
+    if n_pairs == 1:
+        axes = axes.reshape(2, 1)
+
+    for col, (va, vb, label) in enumerate(pairs):
+        curves_a = np.array(results[va]['curves'])   # [n_seeds, n_epochs]
+        curves_b = np.array(results[vb]['curves'])
+        n_epochs = curves_a.shape[1]
+        epochs   = np.arange(1, n_epochs + 1)
+
+        mean_a = curves_a.mean(axis=0)
+        std_a  = curves_a.std(axis=0)
+        mean_b = curves_b.mean(axis=0)
+        std_b  = curves_b.std(axis=0)
+
+        # Per-epoch t-test
+        pvals = np.array([
+            ttest_ind(curves_a[:, t], curves_b[:, t], equal_var=False).pvalue
+            for t in range(n_epochs)
+        ])
+
+        # Crossover epochs
+        perf_cross = next((t + 1 for t in range(n_epochs) if mean_a[t] < mean_b[t]), None)
+        # Last epoch where p<0.05 and A is still ahead
+        sig_cross = None
+        for t in range(n_epochs - 1, -1, -1):
+            if pvals[t] < 0.05 and mean_a[t] > mean_b[t]:
+                sig_cross = t + 1
+                break
+
+        # ── Top panel: accuracy curves ──────────────────────────────────────
+        ax_acc = axes[0, col]
+        ca, cb = colours.get(va, 'C0'), colours.get(vb, 'C1')
+
+        ax_acc.plot(epochs, mean_a, color=ca, label=va)
+        ax_acc.fill_between(epochs, mean_a - std_a, mean_a + std_a, alpha=0.15, color=ca)
+        ax_acc.plot(epochs, mean_b, color=cb, label=vb)
+        ax_acc.fill_between(epochs, mean_b - std_b, mean_b + std_b, alpha=0.15, color=cb)
+
+        if perf_cross is not None:
+            ax_acc.axvline(perf_cross, color='gray', linestyle='--', linewidth=1,
+                           label=f'perf. crossover (ep {perf_cross})')
+        if sig_cross is not None:
+            ax_acc.axvline(sig_cross, color='gray', linestyle=':', linewidth=1,
+                           label=f'last sig. epoch (ep {sig_cross})')
+
+        ax_acc.set_title(label, fontsize=10)
+        ax_acc.set_ylabel('Val accuracy')
+        ax_acc.set_xlabel('Epoch')
+        ax_acc.legend(fontsize=8)
+        ax_acc.grid(True, linestyle='--', alpha=0.4)
+
+        # ── Bottom panel: p-value over epochs ───────────────────────────────
+        ax_p = axes[1, col]
+        ax_p.semilogy(epochs, pvals, color='black', linewidth=1)
+        ax_p.axhline(0.05, color='red', linestyle='--', linewidth=1, label='p = 0.05')
+        ax_p.fill_between(epochs, pvals, 0.05,
+                          where=(pvals < 0.05) & (mean_a > mean_b),
+                          alpha=0.15, color=ca, label=f'{va} significantly better')
+        ax_p.fill_between(epochs, pvals, 0.05,
+                          where=(pvals < 0.05) & (mean_a < mean_b),
+                          alpha=0.15, color=cb, label=f'{vb} significantly better')
+
+        if perf_cross is not None:
+            ax_p.axvline(perf_cross, color='gray', linestyle='--', linewidth=1)
+        if sig_cross is not None:
+            ax_p.axvline(sig_cross, color='gray', linestyle=':', linewidth=1)
+
+        ax_p.set_ylabel('p-value (log scale)')
+        ax_p.set_xlabel('Epoch')
+        ax_p.legend(fontsize=7)
+        ax_p.grid(True, which='both', linestyle='--', alpha=0.4)
+
+        print(f"{label}:")
+        print(f"  Performance crossover : epoch {perf_cross or 'never'}")
+        print(f"  Last significant epoch: epoch {sig_cross or 'never'}")
+
+    plt.suptitle('Transfer learning advantage over training — crossover analysis',
+                 fontsize=11, y=1.01)
+    plt.tight_layout()
+
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, 'epoch_significance.png')
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.show()
+    print(f"Saved {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Sample-efficiency experiment
+# ---------------------------------------------------------------------------
+
+def run_sample_efficiency_experiment(pruned_model, fracs=None, n_seeds=3,
+                                     n_epochs_half=25, **kwargs):
+    """
+    Run run_experiment() once per training-set fraction and collect results.
+
+    Args:
+        pruned_model:  trained pruned digit model
+        fracs:         list of fractions to test (default [0.01, 0.05, 0.1, 0.25, 0.5, 1.0])
+        n_seeds:       seeds per fraction (default 3 — lower than main experiment to save time)
+        n_epochs_half: epochs per half (default 25)
+        **kwargs:      forwarded to run_experiment() (lr, batch_size, etc.)
+
+    Returns:
+        dict {frac: results_dict}  where each results_dict is the standard
+        run_experiment() output (with test_acc_per_seed populated).
+    """
+    if fracs is None:
+        fracs = [0.01, 0.05, 0.1, 0.25, 0.5, 1.0]
+
+    results_by_frac = {}
+    for frac in fracs:
+        print(f"\n{'#'*60}")
+        print(f"# SAMPLE EFFICIENCY — train_frac={frac:.0%}")
+        print(f"{'#'*60}")
+        results_by_frac[frac] = run_experiment(
+            pruned_model,
+            n_seeds=n_seeds,
+            n_epochs_half=n_epochs_half,
+            train_frac=frac,
+            **kwargs,
+        )
+    return results_by_frac
+
+
+def plot_sample_efficiency(results_by_frac, output_dir='results',
+                           variants=None):
+    """
+    Plot test accuracy vs training-set size for each variant.
+
+    Args:
+        results_by_frac: dict {frac: results_dict} from run_sample_efficiency_experiment()
+        output_dir:      where to save the PNG
+        variants:        list of variant names to include (default: all 4 non-regrowth variants)
+    """
+    import os
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    if variants is None:
+        variants = ['frozen_transfer', 'unfrozen_transfer', 'fc_baseline', 'random_frozen']
+
+    colours = {
+        'frozen_transfer':        '#1f77b4',
+        'unfrozen_transfer':      '#2ca02c',
+        'fc_baseline':            '#d62728',
+        'random_frozen':          '#9467bd',
+        'frozen_regrowth':        '#ff7f0e',
+        'random_frozen_regrowth': '#8c564b',
+    }
+
+    # Build arrays: x = n_train, y[variant] = (means, stds)
+    fracs_sorted = sorted(results_by_frac.keys())
+    n_trains = [results_by_frac[f]['_meta']['n_train'] for f in fracs_sorted]
+
+    _, ax = plt.subplots(figsize=(9, 5))
+
+    for v in variants:
+        means, stds = [], []
+        for frac in fracs_sorted:
+            accs = results_by_frac[frac][v].get('test_acc_per_seed', [])
+            if accs:
+                means.append(float(np.mean(accs)))
+                stds.append(float(np.std(accs)))
+            else:
+                means.append(float('nan'))
+                stds.append(0.0)
+        means = np.array(means)
+        stds  = np.array(stds)
+        color = colours.get(v, None)
+        ax.plot(n_trains, means, marker='o', label=v, color=color)
+        ax.fill_between(n_trains, means - stds, means + stds,
+                        alpha=0.15, color=color)
+
+    ax.set_xscale('log')
+    ax.set_xlabel('Training set size')
+    ax.set_ylabel('Test accuracy')
+    ax.set_title('Sample efficiency — test accuracy vs training set size (mean ± std)')
+    ax.legend(fontsize=9)
+    ax.grid(True, which='both', linestyle='--', alpha=0.4)
+
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, 'sample_efficiency.png')
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.show()
+    print(f"Saved {out_path}")
