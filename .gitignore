@@ -14,3 +14,5 @@ training_err.txt
 training_log.txt
 
 run_training.ps1
+
+__pycache__
