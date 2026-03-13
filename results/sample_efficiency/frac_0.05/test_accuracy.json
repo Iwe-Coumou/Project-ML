@@ -1,0 +1,30 @@
+{
+  "frozen_transfer": {
+    "mean": 0.6338,
+    "std": 0.0119
+  },
+  "frozen_regrowth": {
+    "mean": 0.1021,
+    "std": 0.0277
+  },
+  "unfrozen_transfer": {
+    "mean": 0.6638,
+    "std": 0.0114
+  },
+  "fc_baseline": {
+    "mean": 0.5673,
+    "std": 0.0152
+  },
+  "fc_digit_transfer": {
+    "mean": 0.5799,
+    "std": 0.0206
+  },
+  "random_frozen": {
+    "mean": 0.1696,
+    "std": 0.075
+  },
+  "random_frozen_regrowth": {
+    "mean": 0.0795,
+    "std": 0.0115
+  }
+}

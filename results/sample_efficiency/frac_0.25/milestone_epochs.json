@@ -1,0 +1,30 @@
+{
+  "frozen_transfer": {
+    "70%": 28,
+    "80%": 67
+  },
+  "frozen_regrowth": {
+    "70%": 27,
+    "80%": null
+  },
+  "unfrozen_transfer": {
+    "70%": 22,
+    "80%": 51
+  },
+  "fc_baseline": {
+    "70%": 36,
+    "80%": 70
+  },
+  "fc_digit_transfer": {
+    "70%": 34,
+    "80%": 62
+  },
+  "random_frozen": {
+    "70%": null,
+    "80%": null
+  },
+  "random_frozen_regrowth": {
+    "70%": null,
+    "80%": null
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "frozen_transfer": 0.4888,
+  "frozen_regrowth": 0.26,
+  "unfrozen_transfer": 0.5204,
+  "fc_baseline": 0.3511,
+  "fc_digit_transfer": 0.3833,
+  "random_frozen": 0.0964,
+  "random_frozen_regrowth": 0.1048
+}

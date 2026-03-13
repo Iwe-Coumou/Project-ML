@@ -386,6 +386,38 @@ def build_fc_benchmark(pruned_model, n_letters=26):
     return model
 
 
+def build_fc_digit_transfer(pruned_model, n_letters=26,
+                             pretrained_path='fc_digit_pretrained.pth'):
+    """
+    FC MLP (same hidden widths as pruned_model) pre-trained on digits,
+    with the output head replaced for n_letters classes.
+    All weights are trainable.
+
+    This answers: "Does digit pre-training help any same-size FC model,
+    or only the pruned one?"
+    """
+    device = pruned_model.device
+    base = torch.load(pretrained_path, weights_only=False, map_location=device)
+    model = copy.deepcopy(base)
+
+    # Replace output head
+    lin_indices = [i for i, l in enumerate(model.layer_stack)
+                   if isinstance(l, nn.Linear)]
+    last_idx = lin_indices[-1]
+    in_features = model.layer_stack[last_idx].in_features
+    model.layer_stack[last_idx] = nn.Linear(in_features, n_letters).to(device)
+    nn.init.xavier_uniform_(model.layer_stack[last_idx].weight)
+    nn.init.zeros_(model.layer_stack[last_idx].bias)
+
+    # Ensure all weights are trainable
+    for p in model.parameters():
+        p.requires_grad_(True)
+
+    model.optimizer = None
+    print(f"FC digit-transfer built: {_arch_str(model)}")
+    return model
+
+
 # ---------------------------------------------------------------------------
 # Comparison helper
 # ---------------------------------------------------------------------------
@@ -442,6 +474,7 @@ _VARIANTS = [
     'frozen_regrowth',
     'unfrozen_transfer',
     'fc_baseline',
+    'fc_digit_transfer',
     'random_frozen',
     'random_frozen_regrowth',
 ]
@@ -697,7 +730,8 @@ def _run_variant_full(name, model, h1_ds, h2_ds, val_ds, batch_size,
 
 def run_experiment(pruned_model, n_seeds=5, n_epochs_half=50, lr=1e-3,
                    batch_size=4096, threshold_frac=1.5, n_spawn=5,
-                   regrowth_interval=5, device=None, train_frac=1.0):
+                   regrowth_interval=5, device=None, train_frac=1.0,
+                   digit_fc_path='fc_digit_pretrained.pth'):
     """
     Run six transfer-learning variants on EMNIST letters with multiple seeds,
     training all six variants in parallel within each seed.
@@ -782,11 +816,12 @@ def run_experiment(pruned_model, n_seeds=5, n_epochs_half=50, lr=1e-3,
         cmap_fr  = copy.deepcopy(cluster_map_orig)
         cmap_rfr = copy.deepcopy(cluster_map_orig)
 
-        # ── Build all six models ─────────────────────────────────────────────
+        # ── Build all seven models ───────────────────────────────────────────
         m_ft  = build_transfer_model(pruned_model)
         m_fr  = build_transfer_model(pruned_model)
         m_uf  = build_transfer_model(pruned_model)
         m_fc  = build_fc_benchmark(pruned_model)
+        m_fdt = build_fc_digit_transfer(pruned_model, pretrained_path=digit_fc_path)
         m_rf  = build_random_frozen_model(pruned_model)
         m_rfr = build_random_frozen_model(pruned_model)
 
@@ -805,21 +840,22 @@ def run_experiment(pruned_model, n_seeds=5, n_epochs_half=50, lr=1e-3,
             ('frozen_regrowth',        m_fr,  cmap_fr,   frc_fr),
             ('unfrozen_transfer',      m_uf,  None,      None),
             ('fc_baseline',            m_fc,  None,      None),
+            ('fc_digit_transfer',      m_fdt, None,      None),
             ('random_frozen',          m_rf,  None,      None),
             ('random_frozen_regrowth', m_rfr, cmap_rfr,  frc_rfr),
         ]
 
-        # ── Train all six variants in parallel ───────────────────────────────
-        _tprint(f"\n-- Training all 6 variants in parallel (regrowth every "
+        # ── Train all seven variants in parallel ──────────────────────────────
+        _tprint(f"\n-- Training all 7 variants in parallel (regrowth every "
                 f"{regrowth_interval} epochs) --")
         seed_curves = {}
-        with ThreadPoolExecutor(max_workers=6) as pool:
+        with ThreadPoolExecutor(max_workers=7) as pool:
             futures = {
                 pool.submit(
                     _run_variant_full,
                     name, m, h1_ds_tensor, h2_ds_tensor, val_ds_tensor, batch_size,
                     n_epochs_half, criterion, device, lr,
-                    cmap, layer_mapping, threshold_frac, n_spawn, frc,
+                    cmap, copy.deepcopy(layer_mapping) if cmap is not None else layer_mapping, threshold_frac, n_spawn, frc,
                     regrowth_interval,
                 ): name
                 for name, m, cmap, frc in variant_specs
@@ -838,6 +874,7 @@ def run_experiment(pruned_model, n_seeds=5, n_epochs_half=50, lr=1e-3,
                 ('frozen_regrowth',         m_fr),
                 ('unfrozen_transfer',       m_uf),
                 ('fc_baseline',             m_fc),
+                ('fc_digit_transfer',       m_fdt),
                 ('random_frozen',           m_rf),
                 ('random_frozen_regrowth',  m_rfr),
             ]:
@@ -900,6 +937,7 @@ def save_results(results, pruned_model, output_dir='results'):
         'frozen_regrowth':        '#ff7f0e',
         'unfrozen_transfer':      '#2ca02c',
         'fc_baseline':            '#d62728',
+        'fc_digit_transfer':      '#e377c2',
         'random_frozen':          '#9467bd',
         'random_frozen_regrowth': '#8c564b',
     }
@@ -1082,9 +1120,12 @@ def run_significance_tests(results):
     from scipy import stats
 
     pairs = [
-        ('unfrozen_transfer', 'fc_baseline',   'unfrozen_transfer vs fc_baseline'),
-        ('frozen_transfer',   'fc_baseline',   'frozen_transfer vs fc_baseline'),
-        ('frozen_transfer',   'random_frozen', 'frozen_transfer vs random_frozen'),
+        ('unfrozen_transfer',  'fc_baseline',        'unfrozen_transfer vs fc_baseline'),
+        ('frozen_transfer',    'fc_baseline',        'frozen_transfer vs fc_baseline'),
+        ('unfrozen_transfer',  'fc_digit_transfer',  'unfrozen_transfer vs fc_digit_transfer'),
+        ('frozen_transfer',    'fc_digit_transfer',  'frozen_transfer vs fc_digit_transfer'),
+        ('fc_digit_transfer',  'fc_baseline',        'fc_digit_transfer vs fc_baseline'),
+        ('frozen_transfer',    'random_frozen',      'frozen_transfer vs random_frozen'),
     ]
     out = {}
     for a, b, label in pairs:
@@ -1157,6 +1198,7 @@ def plot_learning_curves_static(results, output_dir='results'):
         'frozen_regrowth':        '#ff7f0e',
         'unfrozen_transfer':      '#2ca02c',
         'fc_baseline':            '#d62728',
+        'fc_digit_transfer':      '#e377c2',
         'random_frozen':          '#9467bd',
         'random_frozen_regrowth': '#8c564b',
     }
@@ -1477,9 +1519,10 @@ def plot_cluster_ablation_grid(
 # Epoch-level significance — crossover analysis
 # ---------------------------------------------------------------------------
 
-def plot_epoch_significance(results, pairs=None, output_dir='results'):
+def plot_epoch_significance(results, pairs=None, output_dir='results',
+                             baseline='fc_baseline'):
     """
-    Show when transfer learning stops being better than the FC baseline.
+    Show when transfer learning stops being better than a baseline.
 
     For each pair of variants, computes at every epoch:
       - mean accuracy per variant (± std over seeds)
@@ -1496,24 +1539,28 @@ def plot_epoch_significance(results, pairs=None, output_dir='results'):
     Args:
         results:    output of run_experiment()
         pairs:      list of (variant_a, variant_b, label) tuples.
-                    Default: the two key comparisons against fc_baseline.
+                    Default: the two key comparisons against `baseline`.
         output_dir: where to save the PNG
+        baseline:   which baseline to compare against when pairs is None.
+                    Either 'fc_baseline' or 'fc_digit_transfer'.
     """
     import os
     import numpy as np
     import matplotlib.pyplot as plt
     from scipy.stats import ttest_ind
 
+    _custom_pairs = pairs is not None
     if pairs is None:
         pairs = [
-            ('unfrozen_transfer', 'fc_baseline', 'unfrozen_transfer vs fc_baseline'),
-            ('frozen_transfer',   'fc_baseline', 'frozen_transfer vs fc_baseline'),
+            ('unfrozen_transfer', baseline, f'unfrozen_transfer vs {baseline}'),
+            ('frozen_transfer',   baseline, f'frozen_transfer vs {baseline}'),
         ]
 
     colours = {
         'frozen_transfer':        '#1f77b4',
         'unfrozen_transfer':      '#2ca02c',
         'fc_baseline':            '#d62728',
+        'fc_digit_transfer':      '#e377c2',
         'random_frozen':          '#9467bd',
         'frozen_regrowth':        '#ff7f0e',
         'random_frozen_regrowth': '#8c564b',
@@ -1603,8 +1650,113 @@ def plot_epoch_significance(results, pairs=None, output_dir='results'):
     plt.tight_layout()
 
     os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, 'epoch_significance.png')
+    fname = 'epoch_significance.png' if _custom_pairs else f'epoch_significance_{baseline}.png'
+    out_path = os.path.join(output_dir, fname)
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.show()
+    print(f"Saved {out_path}")
+
+
+def plot_sample_efficiency_crossover(se_results, pairs=None,
+                                     output_dir='results/sample_efficiency'):
+    """
+    For each training-set fraction, compute the last epoch where variant A
+    is significantly better than variant B (p < 0.05, mean_A > mean_B).
+    Plot this crossover epoch vs dataset fraction for each pair.
+
+    Args:
+        se_results: dict {frac: results_dict} from run_sample_efficiency_experiment()
+        pairs:      list of (variant_a, variant_b, label) — same format as
+                    plot_epoch_significance(). Default: unfrozen_transfer and
+                    frozen_transfer vs fc_baseline.
+        output_dir: where to save the PNG
+    """
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from scipy.stats import ttest_ind
+
+    if pairs is None:
+        pairs = [
+            ('unfrozen_transfer', 'fc_baseline',       'unfrozen_transfer vs fc_baseline'),
+            ('frozen_transfer',   'fc_baseline',       'frozen_transfer vs fc_baseline'),
+            ('unfrozen_transfer', 'fc_digit_transfer', 'unfrozen_transfer vs fc_digit_transfer'),
+            ('frozen_transfer',   'fc_digit_transfer', 'frozen_transfer vs fc_digit_transfer'),
+        ]
+
+    colours = {
+        'unfrozen_transfer vs fc_baseline':       '#2ca02c',
+        'frozen_transfer vs fc_baseline':         '#1f77b4',
+        'unfrozen_transfer vs fc_digit_transfer': '#98df8a',  # lighter green
+        'frozen_transfer vs fc_digit_transfer':   '#aec7e8',  # lighter blue
+    }
+
+    fracs = sorted(se_results.keys())
+
+    # Group pairs by variant_a so each transfer variant gets its own subplot
+    subplot_groups = {}
+    for va, vb, label in pairs:
+        subplot_groups.setdefault(va, []).append((vb, label))
+    group_keys = list(subplot_groups.keys())
+
+    fig, axes = plt.subplots(1, len(group_keys), figsize=(7 * len(group_keys), 5),
+                              sharey=True)
+    if len(group_keys) == 1:
+        axes = [axes]
+
+    total_epochs = None
+    for ax, va in zip(axes, group_keys):
+        for vb, label in subplot_groups[va]:
+            last_sig_epochs = []
+            perf_cross_epochs = []
+
+            for frac in fracs:
+                res = se_results[frac]
+                curves_a = np.array(res[va]['curves'])
+                curves_b = np.array(res[vb]['curves'])
+                n_epochs = curves_a.shape[1]
+                total_epochs = n_epochs
+
+                mean_a = curves_a.mean(axis=0)
+                mean_b = curves_b.mean(axis=0)
+                pvals  = np.array([
+                    ttest_ind(curves_a[:, t], curves_b[:, t], equal_var=False).pvalue
+                    for t in range(n_epochs)
+                ])
+
+                sig_better = (mean_a > mean_b) & (pvals < 0.05)
+                last_sig = int(np.where(sig_better)[0][-1]) + 1 if sig_better.any() else 0
+                last_sig_epochs.append(last_sig)
+
+                cross = next((t + 1 for t in range(n_epochs) if mean_a[t] < mean_b[t]), n_epochs)
+                perf_cross_epochs.append(cross)
+
+            col = colours.get(label, None)
+            ax.plot(fracs, last_sig_epochs, 'o-', label=f'vs {vb} (last sig.)',
+                    color=col, linewidth=2, markersize=6)
+            ax.plot(fracs, perf_cross_epochs, 's--', label=f'vs {vb} (perf. crossover)',
+                    color=col, linewidth=1.5, markersize=5, alpha=0.6)
+
+            for frac, ls, pc in zip(fracs, last_sig_epochs, perf_cross_epochs):
+                print(f"  {label} @ {frac:.0%}: last sig epoch={ls}, perf crossover={pc}")
+
+        ax.axhline(total_epochs, color='gray', linestyle=':', linewidth=1,
+                   label=f'max epochs ({total_epochs})')
+        ax.set_xscale('log')
+        ax.set_xticks(fracs)
+        ax.set_xticklabels([f'{int(f * 100)}%' for f in fracs])
+        ax.set_xlabel('Training set size')
+        ax.set_ylabel('Epoch')
+        ax.set_title(f'{va} — advantage duration vs dataset size')
+        ax.legend(fontsize=8)
+        ax.grid(True, which='both', linestyle='--', alpha=0.4)
+
+    plt.suptitle('Transfer learning advantage duration vs training set size', fontsize=11)
+    plt.tight_layout()
+
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, 'crossover_vs_fraction.png')
+    plt.savefig(out_path, dpi=150)
     plt.show()
     print(f"Saved {out_path}")
 
@@ -1614,36 +1766,53 @@ def plot_epoch_significance(results, pairs=None, output_dir='results'):
 # ---------------------------------------------------------------------------
 
 def run_sample_efficiency_experiment(pruned_model, fracs=None, n_seeds=3,
-                                     n_epochs_half=25, **kwargs):
+                                     n_epochs_half=25, verbose=False,
+                                     digit_fc_path='fc_digit_pretrained.pth',
+                                     **kwargs):
     """
     Run run_experiment() once per training-set fraction and collect results.
 
     Args:
         pruned_model:  trained pruned digit model
-        fracs:         list of fractions to test (default [0.01, 0.05, 0.1, 0.25, 0.5, 1.0])
-        n_seeds:       seeds per fraction (default 3 — lower than main experiment to save time)
+        fracs:         list of fractions to test (default [0.05, 0.1, 0.25, 0.5, 1.0])
+        n_seeds:       seeds per fraction (default 3)
         n_epochs_half: epochs per half (default 25)
+        verbose:       if False (default), suppress all per-epoch printing
         **kwargs:      forwarded to run_experiment() (lr, batch_size, etc.)
 
     Returns:
         dict {frac: results_dict}  where each results_dict is the standard
         run_experiment() output (with test_acc_per_seed populated).
     """
+    import io, contextlib, os
     if fracs is None:
-        fracs = [0.01, 0.05, 0.1, 0.25, 0.5, 1.0]
+        fracs = [0.05, 0.1, 0.25, 0.5, 1.0]
+
+    output_dir = kwargs.pop('output_dir', 'results/sample_efficiency')
+    os.makedirs(output_dir, exist_ok=True)
 
     results_by_frac = {}
     for frac in fracs:
         print(f"\n{'#'*60}")
         print(f"# SAMPLE EFFICIENCY — train_frac={frac:.0%}")
-        print(f"{'#'*60}")
-        results_by_frac[frac] = run_experiment(
-            pruned_model,
-            n_seeds=n_seeds,
-            n_epochs_half=n_epochs_half,
-            train_frac=frac,
-            **kwargs,
-        )
+        print(f"{'#'*60}", flush=True)
+
+        ctx = contextlib.redirect_stdout(io.StringIO()) if not verbose else contextlib.nullcontext()
+        with ctx:
+            res = run_experiment(
+                pruned_model,
+                n_seeds=n_seeds,
+                n_epochs_half=n_epochs_half,
+                train_frac=frac,
+                digit_fc_path=digit_fc_path,
+                **kwargs,
+            )
+            frac_label = f"{frac:.2f}".rstrip('0').rstrip('.')
+            frac_dir   = os.path.join(output_dir, f"frac_{frac_label}")
+            save_results(res, pruned_model, output_dir=frac_dir)
+
+        print(f"  done — saved to {frac_dir}", flush=True)
+        results_by_frac[frac] = res
     return results_by_frac
 
 
@@ -1662,12 +1831,14 @@ def plot_sample_efficiency(results_by_frac, output_dir='results',
     import numpy as np
 
     if variants is None:
-        variants = ['frozen_transfer', 'unfrozen_transfer', 'fc_baseline', 'random_frozen']
+        variants = ['frozen_transfer', 'unfrozen_transfer', 'fc_baseline',
+                    'fc_digit_transfer', 'random_frozen']
 
     colours = {
         'frozen_transfer':        '#1f77b4',
         'unfrozen_transfer':      '#2ca02c',
         'fc_baseline':            '#d62728',
+        'fc_digit_transfer':      '#e377c2',
         'random_frozen':          '#9467bd',
         'frozen_regrowth':        '#ff7f0e',
         'random_frozen_regrowth': '#8c564b',

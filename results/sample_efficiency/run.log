@@ -1,0 +1,35 @@
+device being used: cuda
+Device: cuda
+Architecture: 784 → 36 → 26 → 21 → 17 → 10
+
+############################################################
+# SAMPLE EFFICIENCY — train_frac=1%
+############################################################
+  done — saved to results/sample_efficiency\frac_0.01
+
+############################################################
+# SAMPLE EFFICIENCY — train_frac=5%
+############################################################
+  done — saved to results/sample_efficiency\frac_0.05
+
+############################################################
+# SAMPLE EFFICIENCY — train_frac=10%
+############################################################
+  done — saved to results/sample_efficiency\frac_0.1
+
+############################################################
+# SAMPLE EFFICIENCY — train_frac=25%
+############################################################
+  done — saved to results/sample_efficiency\frac_0.25
+
+############################################################
+# SAMPLE EFFICIENCY — train_frac=50%
+############################################################
+  done — saved to results/sample_efficiency\frac_0.5
+
+############################################################
+# SAMPLE EFFICIENCY — train_frac=100%
+############################################################
+  done — saved to results/sample_efficiency\frac_1
+
+se_results saved to results/sample_efficiency\se_results.pt
