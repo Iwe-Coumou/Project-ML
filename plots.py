@@ -155,7 +155,7 @@ def plot_cluster_accuracy_bars(cluster_results, target_labels=None, n_cols=4, fi
         fig.delaxes(axes[j//n_cols, j%n_cols])
     
     fig.tight_layout()
-    plt.show()
+    return fig
 
 def plot_accuracy(metrics):
     """

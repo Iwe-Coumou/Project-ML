@@ -471,12 +471,10 @@ def _arch_str(model):
 
 _VARIANTS = [
     'frozen_transfer',
-    'frozen_regrowth',
     'unfrozen_transfer',
     'fc_baseline',
     'fc_digit_transfer',
     'random_frozen',
-    'random_frozen_regrowth',
 ]
 
 
@@ -1039,7 +1037,7 @@ def save_results(results, pruned_model, output_dir='results'):
     print(f"  Saved per_run_curves.json")
 
     # ── cluster_ablation.html ───────────────────────────────────────────────
-    regrowth_variants = ['frozen_regrowth', 'random_frozen_regrowth']
+    regrowth_variants = []
     fig_ab = go.Figure()
     for v in regrowth_variants:
         ablation_runs = results[v]['ablation']
@@ -1159,7 +1157,7 @@ def plot_final_comparison(results, sig_tests=None, output_dir='results'):
             means.append(float(np.mean(last)) if last else 0.0)
             stds.append(float(np.std(last))  if last else 0.0)
 
-    colours = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b']
+    colours = ['#1f77b4', '#2ca02c', '#d62728', '#e377c2', '#9467bd']
     x = np.arange(len(variants))
 
     fig, ax = plt.subplots(figsize=(9, 5))

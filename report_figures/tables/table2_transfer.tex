@@ -1,0 +1,11 @@
+\begin{tabular}{lrrrr}
+\toprule
+Variant & AUC & 70\% epoch & 80\% epoch & Test acc (mean$\pm$std) \\
+\midrule
+Pruned frozen & 0.8108 & 8 & 21 & $0.8657\pm0.0025$ \\
+Pruned unfrozen & 0.8260 & 6 & 15 & $0.8739\pm0.0026$ \\
+FC baseline & 0.7984 & 11 & 26 & $0.8734\pm0.0029$ \\
+FC (digit pretrained) & 0.8212 & 9 & 18 & $0.8877\pm0.0015$ \\
+Random frozen & 0.4693 &  --  &  --  & $0.6397\pm0.0225$ \\
+\bottomrule
+\end{tabular}
