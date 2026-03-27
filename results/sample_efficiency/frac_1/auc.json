@@ -1,9 +1,9 @@
 {
-  "frozen_transfer": 0.811,
-  "frozen_regrowth": 0.4807,
-  "unfrozen_transfer": 0.8262,
-  "fc_baseline": 0.7976,
-  "fc_digit_transfer": 0.8214,
-  "random_frozen": 0.4694,
-  "random_frozen_regrowth": 0.2506
+  "frozen_transfer": 0.8112,
+  "frozen_regrowth": 0.4808,
+  "unfrozen_transfer": 0.8266,
+  "fc_baseline": 0.7978,
+  "fc_digit_transfer": 0.8212,
+  "random_frozen": 0.4685,
+  "random_frozen_regrowth": 0.2497
 }

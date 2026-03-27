@@ -1,0 +1,60 @@
+Experiment summary — 5 seed(s), 50 epochs/half
+============================================================
+
+Final accuracy (mean ± std):
+  frozen_transfer                 0.8046 ± 0.0034
+  frozen_regrowth                 0.1330 ± 0.0187
+  unfrozen_transfer               0.8202 ± 0.0070
+  fc_baseline                     0.7951 ± 0.0029
+  fc_digit_transfer               0.8158 ± 0.0090
+  random_frozen                   0.3334 ± 0.0966
+  random_frozen_regrowth          0.1146 ± 0.0275
+
+AUC (normalised):
+  frozen_transfer                 0.6836
+  frozen_regrowth                 0.3807
+  unfrozen_transfer               0.7102
+  fc_baseline                     0.6262
+  fc_digit_transfer               0.6489
+  random_frozen                   0.2393
+  random_frozen_regrowth          0.1486
+
+Milestone epochs (70% / 80%):
+  frozen_transfer                 70%: 37  80%: 93
+  frozen_regrowth                 70%: 37  80%: None
+  unfrozen_transfer               70%: 30  80%: 70
+  fc_baseline                     70%: 49  80%: None
+  fc_digit_transfer               70%: 45  80%: 84
+  random_frozen                   70%: None  80%: None
+  random_frozen_regrowth          70%: None  80%: None
+
+Cluster ablation (mean letter drop, regrowth variants):
+  frozen_regrowth C2: 0.0000
+  frozen_regrowth C4: 0.0000
+  frozen_regrowth C5: 0.0000
+  frozen_regrowth C6: 0.0000
+  frozen_regrowth C7: 0.0000
+  frozen_regrowth C8: 0.0000
+  frozen_regrowth C9: 0.0000
+  frozen_regrowth C10: 0.0000
+  random_frozen_regrowth C2: 0.0000
+  random_frozen_regrowth C4: 0.0000
+  random_frozen_regrowth C5: 0.0000
+  random_frozen_regrowth C6: 0.0000
+  random_frozen_regrowth C7: 0.0000
+  random_frozen_regrowth C8: 0.0000
+  random_frozen_regrowth C9: 0.0000
+  random_frozen_regrowth C10: 0.0000
+
+Test-set accuracy (mean ± std):
+  frozen_transfer                 0.8000 ± 0.0031
+  frozen_regrowth                 0.1346 ± 0.0204
+  unfrozen_transfer               0.8145 ± 0.0081
+  fc_baseline                     0.7885 ± 0.0029
+  fc_digit_transfer               0.8115 ± 0.0091
+  random_frozen                   0.3321 ± 0.0942
+  random_frozen_regrowth          0.1151 ± 0.0296
+
+NOTE — collapsed variants (final acc < 0.15, near chance):
+  frozen_regrowth: final val acc = 0.1330. Hypothesis: stale layer_mapping after regrowth corrupts ablation measurement on the second regrowth call, causing mode collapse. Framed as a negative result / future work.
+  random_frozen_regrowth: final val acc = 0.1146. Hypothesis: stale layer_mapping after regrowth corrupts ablation measurement on the second regrowth call, causing mode collapse. Framed as a negative result / future work.

@@ -1,0 +1,10 @@
+device being used: cuda
+Device: cuda
+Architecture: 784 → 36 → 26 → 21 → 17 → 10
+
+############################################################
+# SAMPLE EFFICIENCY — train_frac=25%
+############################################################
+  done — saved to results/sample_efficiency/test\frac_0.25
+
+se_results saved to results/sample_efficiency/test\se_results.pt

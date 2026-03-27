@@ -2,28 +2,28 @@ Experiment summary — 5 seed(s), 50 epochs/half
 ============================================================
 
 Final accuracy (mean ± std):
-  frozen_transfer                 0.8256 ± 0.0026
+  frozen_transfer                 0.8254 ± 0.0025
   frozen_regrowth                 0.1406 ± 0.0153
-  unfrozen_transfer               0.8416 ± 0.0037
-  fc_baseline                     0.8287 ± 0.0029
-  fc_digit_transfer               0.8431 ± 0.0050
-  random_frozen                   0.3936 ± 0.0669
+  unfrozen_transfer               0.8422 ± 0.0033
+  fc_baseline                     0.8290 ± 0.0025
+  fc_digit_transfer               0.8426 ± 0.0051
+  random_frozen                   0.3921 ± 0.0675
   random_frozen_regrowth          0.1255 ± 0.0279
 
 AUC (normalised):
-  frozen_transfer                 0.7172
-  frozen_regrowth                 0.4034
+  frozen_transfer                 0.7171
+  frozen_regrowth                 0.4033
   unfrozen_transfer               0.7427
-  fc_baseline                     0.6754
+  fc_baseline                     0.6756
   fc_digit_transfer               0.6917
-  random_frozen                   0.2627
-  random_frozen_regrowth          0.1587
+  random_frozen                   0.2625
+  random_frozen_regrowth          0.1583
 
 Milestone epochs (70% / 80%):
-  frozen_transfer                 70%: 28  80%: 67
+  frozen_transfer                 70%: 28  80%: 66
   frozen_regrowth                 70%: 27  80%: None
   unfrozen_transfer               70%: 22  80%: 51
-  fc_baseline                     70%: 36  80%: 70
+  fc_baseline                     70%: 36  80%: 69
   fc_digit_transfer               70%: 34  80%: 62
   random_frozen                   70%: None  80%: None
   random_frozen_regrowth          70%: None  80%: None
@@ -47,12 +47,12 @@ Cluster ablation (mean letter drop, regrowth variants):
   random_frozen_regrowth C10: 0.0000
 
 Test-set accuracy (mean ± std):
-  frozen_transfer                 0.8219 ± 0.0031
+  frozen_transfer                 0.8221 ± 0.0029
   frozen_regrowth                 0.1429 ± 0.0167
-  unfrozen_transfer               0.8369 ± 0.0041
-  fc_baseline                     0.8233 ± 0.0018
-  fc_digit_transfer               0.8375 ± 0.0066
-  random_frozen                   0.3920 ± 0.0643
+  unfrozen_transfer               0.8368 ± 0.0046
+  fc_baseline                     0.8240 ± 0.0024
+  fc_digit_transfer               0.8373 ± 0.0067
+  random_frozen                   0.3912 ± 0.0645
   random_frozen_regrowth          0.1266 ± 0.0302
 
 NOTE — collapsed variants (final acc < 0.15, near chance):

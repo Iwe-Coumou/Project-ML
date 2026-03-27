@@ -16,7 +16,7 @@ import os
 import torch
 
 # ── redirect stdout to log file (and keep it in the console too) ──────────────
-LOG_DIR = "results/sample_efficiency"
+LOG_DIR = "results/sample_efficiency/test"
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_PATH = os.path.join(LOG_DIR, "run.log")
 
@@ -24,11 +24,12 @@ class _Tee:
     """Write to both a file and the original stdout."""
     def __init__(self, file_path):
         self._file = open(file_path, "w", buffering=1, encoding="utf-8")
+        assert sys.__stdout__ is not None
         self._stdout = sys.__stdout__
 
     def write(self, data):
         self._file.write(data)
-        self._stdout.write(data)
+        self._stdout.write(data.encode(self._stdout.encoding, errors="replace").decode(self._stdout.encoding))
 
     def flush(self):
         self._file.flush()
@@ -62,7 +63,8 @@ if not os.path.exists(DIGIT_FC_PATH):
 # ── run experiment ─────────────────────────────────────────────────────────────
 se_results = ffl.run_sample_efficiency_experiment(
     pruned_model,
-    fracs=[0.01, 0.05, 0.1, 0.175, 0.25, 0.5, 0.75, 1.0],
+    #fracs=[0.01, 0.05, 0.1, 0.175, 0.25, 0.5, 0.75, 1.0],
+    fracs=[0.25],
     n_seeds=5,
     n_epochs_half=50,
     digit_fc_path=DIGIT_FC_PATH,

@@ -1,8 +1,8 @@
 Final epoch accuracy (mean ± std across seeds)
-  frozen_transfer                 0.7431 ± 0.0064
+  frozen_transfer                 0.7431 ± 0.0065
   frozen_regrowth                 0.1221 ± 0.0222
-  unfrozen_transfer               0.7732 ± 0.0059
-  fc_baseline                     0.7206 ± 0.0104
-  fc_digit_transfer               0.7206 ± 0.0292
-  random_frozen                   0.2601 ± 0.0742
+  unfrozen_transfer               0.7732 ± 0.0061
+  fc_baseline                     0.7206 ± 0.0093
+  fc_digit_transfer               0.7209 ± 0.0298
+  random_frozen                   0.2603 ± 0.0741
   random_frozen_regrowth          0.0816 ± 0.0111

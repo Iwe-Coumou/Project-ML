@@ -1,0 +1,8 @@
+Area under learning curve (normalised by n_epochs)
+  frozen_transfer                0.6836
+  frozen_regrowth                0.3807
+  unfrozen_transfer              0.7102
+  fc_baseline                    0.6262
+  fc_digit_transfer              0.6489
+  random_frozen                  0.2393
+  random_frozen_regrowth         0.1486

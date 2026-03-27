@@ -1,0 +1,8 @@
+Final test-set accuracy (mean ± std across seeds)
+  frozen_transfer                 0.8224 ± 0.0030
+  frozen_regrowth                 0.8293 ± 0.0060
+  unfrozen_transfer               0.8368 ± 0.0042
+  fc_baseline                     0.8235 ± 0.0020
+  fc_digit_transfer               0.8372 ± 0.0069
+  random_frozen                   0.3909 ± 0.0650
+  random_frozen_regrowth          0.3725 ± 0.0648

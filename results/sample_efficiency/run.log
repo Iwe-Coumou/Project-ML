@@ -1,35 +1,46 @@
 device being used: cuda
 Device: cuda
-Architecture: 784 â†’ 36 â†’ 26 â†’ 21 â†’ 17 â†’ 10
+Architecture: 784 ? 36 ? 26 ? 21 ? 17 ? 10
 
 ############################################################
-# SAMPLE EFFICIENCY â€” train_frac=1%
+# SAMPLE EFFICIENCY — train_frac=1%
 ############################################################
-  done â€” saved to results/sample_efficiency\frac_0.01
+  done — saved to results/sample_efficiency\frac_0.01
 
 ############################################################
-# SAMPLE EFFICIENCY â€” train_frac=5%
+# SAMPLE EFFICIENCY — train_frac=5%
 ############################################################
-  done â€” saved to results/sample_efficiency\frac_0.05
+  done — saved to results/sample_efficiency\frac_0.05
 
 ############################################################
-# SAMPLE EFFICIENCY â€” train_frac=10%
+# SAMPLE EFFICIENCY — train_frac=10%
 ############################################################
-  done â€” saved to results/sample_efficiency\frac_0.1
+  done — saved to results/sample_efficiency\frac_0.1
 
 ############################################################
-# SAMPLE EFFICIENCY â€” train_frac=25%
+# SAMPLE EFFICIENCY — train_frac=18%
 ############################################################
-  done â€” saved to results/sample_efficiency\frac_0.25
+  done — saved to results/sample_efficiency\frac_0.17
 
 ############################################################
-# SAMPLE EFFICIENCY â€” train_frac=50%
+# SAMPLE EFFICIENCY — train_frac=25%
 ############################################################
-  done â€” saved to results/sample_efficiency\frac_0.5
+  done — saved to results/sample_efficiency\frac_0.25
 
 ############################################################
-# SAMPLE EFFICIENCY â€” train_frac=100%
+# SAMPLE EFFICIENCY — train_frac=50%
 ############################################################
-  done â€” saved to results/sample_efficiency\frac_1
+  done — saved to results/sample_efficiency\frac_0.5
+
+############################################################
+# SAMPLE EFFICIENCY — train_frac=75%
+############################################################
+  done — saved to results/sample_efficiency\frac_0.75
+
+############################################################
+# SAMPLE EFFICIENCY — train_frac=100%
+############################################################
+  done — saved to results/sample_efficiency\frac_1
 
 se_results saved to results/sample_efficiency\se_results.pt
+Log written to results/sample_efficiency\run.log

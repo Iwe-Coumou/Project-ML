@@ -570,6 +570,12 @@ def _measure_cluster_ablation(model, cluster_map, layer_mapping, val_loader, dev
     drops = {}
     for cluster_id, neuron_indices in cluster_map.items():
         backups = {}
+        layer_info = []  # (layer_num, layer_idx, local_idxs)
+
+        # Pass 1: compute local indices and back up ALL data before any zeroing.
+        # Interleaving backup with zeroing corrupts backups for multi-layer clusters:
+        # zeroing "next_layer columns" in one iteration modifies data that a later
+        # iteration still needs to back up as "layer rows".
         for lname, start, end in layer_mapping:
             layer_num  = int(lname.split('_')[1])
             layer_idx  = linear_indices[layer_num]
@@ -577,16 +583,23 @@ def _measure_cluster_ablation(model, cluster_map, layer_mapping, val_loader, dev
             local_idxs = [gi - start for gi in neuron_indices if start <= gi < end]
             if not local_idxs:
                 continue
+            layer_info.append((layer_num, layer_idx, local_idxs))
             backups[layer_idx] = {
                 'w': layer.weight.data[local_idxs, :].clone(),
                 'b': layer.bias.data[local_idxs].clone(),
                 'idxs': local_idxs,
             }
+            if layer_num + 1 < len(linear_indices):
+                next_layer = model.layer_stack[linear_indices[layer_num + 1]]
+                backups[layer_idx]['next_w'] = next_layer.weight.data[:, local_idxs].clone()
+
+        # Pass 2: zero out cluster neurons now that all backups are safe.
+        for layer_num, layer_idx, local_idxs in layer_info:
+            layer = model.layer_stack[layer_idx]
             layer.weight.data[local_idxs, :] = 0
             layer.bias.data[local_idxs]      = 0
             if layer_num + 1 < len(linear_indices):
                 next_layer = model.layer_stack[linear_indices[layer_num + 1]]
-                backups[layer_idx]['next_w'] = next_layer.weight.data[:, local_idxs].clone()
                 next_layer.weight.data[:, local_idxs] = 0
 
         correct_abl = 0
@@ -813,8 +826,11 @@ def error_driven_regrowth(model, cluster_map, layer_mapping, val_loader,
                     [model.connection_masks[layer_idx], (new_row != 0).float().unsqueeze(0)], dim=0
                 )
             if next_layer_idx in model.connection_masks:
+                out_mask = torch.zeros(out_features_next, device=dev)
+                for i in allowed_out:
+                    out_mask[i] = 1.0
                 model.connection_masks[next_layer_idx] = torch.cat(
-                    [model.connection_masks[next_layer_idx], (new_col != 0).float().unsqueeze(1)], dim=1
+                    [model.connection_masks[next_layer_idx], out_mask.unsqueeze(1)], dim=1
                 )
 
             # Register new neuron in cluster_map.

@@ -1,0 +1,8 @@
+First epoch reaching accuracy threshold (None = never reached)
+  frozen_transfer                 70%: 37  80%: 93
+  frozen_regrowth                 70%: 37  80%: None
+  unfrozen_transfer               70%: 30  80%: 70
+  fc_baseline                     70%: 49  80%: None
+  fc_digit_transfer               70%: 45  80%: 84
+  random_frozen                   70%: None  80%: None
+  random_frozen_regrowth          70%: None  80%: None

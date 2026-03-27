@@ -1,0 +1,56 @@
+Experiment summary — 5 seed(s), 50 epochs/half
+============================================================
+
+Final accuracy (mean ± std):
+  frozen_transfer                 0.8256 ± 0.0023
+  frozen_regrowth                 0.8344 ± 0.0049
+  unfrozen_transfer               0.8415 ± 0.0034
+  fc_baseline                     0.8288 ± 0.0034
+  fc_digit_transfer               0.8431 ± 0.0046
+  random_frozen                   0.3925 ± 0.0673
+  random_frozen_regrowth          0.3740 ± 0.0677
+
+AUC (normalised):
+  frozen_transfer                 0.7171
+  frozen_regrowth                 0.7215
+  unfrozen_transfer               0.7427
+  fc_baseline                     0.6750
+  fc_digit_transfer               0.6916
+  random_frozen                   0.2623
+  random_frozen_regrowth          0.2574
+
+Milestone epochs (70% / 80%):
+  frozen_transfer                 70%: 28  80%: 66
+  frozen_regrowth                 70%: 27  80%: 62
+  unfrozen_transfer               70%: 22  80%: 51
+  fc_baseline                     70%: 36  80%: 70
+  fc_digit_transfer               70%: 34  80%: 62
+  random_frozen                   70%: None  80%: None
+  random_frozen_regrowth          70%: None  80%: None
+
+Cluster ablation (mean letter drop, regrowth variants):
+  frozen_regrowth C2: 0.2871
+  frozen_regrowth C4: 0.2826
+  frozen_regrowth C5: 0.3185
+  frozen_regrowth C6: 0.3661
+  frozen_regrowth C7: 0.3548
+  frozen_regrowth C8: 0.4160
+  frozen_regrowth C9: 0.3954
+  frozen_regrowth C10: 0.3189
+  random_frozen_regrowth C2: 0.0137
+  random_frozen_regrowth C4: 0.0136
+  random_frozen_regrowth C5: 0.0274
+  random_frozen_regrowth C6: 0.0317
+  random_frozen_regrowth C7: 0.0204
+  random_frozen_regrowth C8: 0.0253
+  random_frozen_regrowth C9: 0.0329
+  random_frozen_regrowth C10: 0.0116
+
+Test-set accuracy (mean ± std):
+  frozen_transfer                 0.8224 ± 0.0030
+  frozen_regrowth                 0.8293 ± 0.0060
+  unfrozen_transfer               0.8368 ± 0.0042
+  fc_baseline                     0.8235 ± 0.0020
+  fc_digit_transfer               0.8372 ± 0.0069
+  random_frozen                   0.3909 ± 0.0650
+  random_frozen_regrowth          0.3725 ± 0.0648
